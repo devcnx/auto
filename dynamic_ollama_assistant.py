@@ -1,22 +1,29 @@
-#!/usr/bin/env python3
 """
 Dynamic, interactive Ollama assistant loader (CSV-based, IDE-friendly).
 
-WHAT'S NEW
-- Uses a folder of CSV files (one per original sheet), e.g.:
+This module is used to load a folder of CSV files (one per original sheet), e.g.:
+
     Mega-Prompts for Business.csv
     Mega-Prompts for Marketing.csv
     Mega-Prompts for Productivity.csv
     Mega-Prompts for Sales.csv
     Mega-Prompts for Writing.csv
-- Each CSV is treated like a "sheet"; we derive a Sheet name from the filename.
-- No CLI args; prompts you to pick Category → Sub-Category → Page, then fill placeholders, 
+
+Each CSV is treated like a "sheet"; we derive a Sheet name from the filename.
+No CLI args; prompts you to pick Category → Sub-Category → Page, then fill placeholders, 
 then chat via Ollama.
 
 Prereqs: 
   pip install pandas requests
   ollama serve
   ollama pull llama3.1   # or your preferred model
+  
+Imports:
+    - glob: Used to find all CSV files in the specified directory and pattern.
+    - dataclasses: Used to create a dataclass for the PromptData.
+    - datetime: Used to get the current date and time.
+    - typing: Used to type hint the functions and variables.    
+    
 """
 
 import glob
@@ -24,6 +31,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -38,6 +46,33 @@ CSV_GLOB = os.environ.get("MEGAPROMPTS_CSV_GLOB", "Mega-Prompts for *.csv")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 # --------------------------------------------------------------
+
+
+@dataclass
+class PromptData:
+    """A container for all the data related to a single prompt."""
+
+    mega_prompt: str
+    prompt_name: str
+    description: str
+    what_this_does: str
+    tips: str
+    how_to_use: str
+    additional_tips: str
+
+    @classmethod
+    def from_series(cls, row: pd.Series) -> "PromptData":
+        """Create a PromptData instance from a pandas Series."""
+        return cls(
+            mega_prompt=row.get("Mega-Prompt", ""),
+            prompt_name=row.get("Prompt Name", ""),
+            description=row.get("Description ", "") or row.get("Description", ""),
+            what_this_does=row.get("What This Mega-Prompt Does", ""),
+            tips=row.get("Tips", ""),
+            how_to_use=row.get("How to Use ", "") or row.get("How to Use", ""),
+            additional_tips=row.get("Additional Tips", ""),
+        )
+
 
 PLACEHOLDER_PATTERNS = [
     r"\[\[([^\]]+)\]\]",  # [[placeholder]]
@@ -60,6 +95,17 @@ EXPECTED_COLUMNS = [
 
 
 def find_placeholders(text: str) -> List[str]:
+    """
+    Locate all placeholders within the text of the `Mega-Prompt` column.
+
+    Parameters:
+        - text: The text to search for placeholders.
+        :type text: str
+
+    Returns:
+        - A list of all located placeholders.
+        :rtype: List[str]
+    """
     if not isinstance(text, str):
         return []
     found = []
@@ -72,16 +118,57 @@ def find_placeholders(text: str) -> List[str]:
 
 
 def replace_placeholders(text: str, values: Dict[str, str]) -> str:
+    """
+    Replace placeholders in the text with their corresponding values.
+
+    Parameters:
+        - text: The text to replace placeholders in.
+        :type text: str
+        - values: A dictionary of placeholder values.
+        :type values: Dict[str, str]
+
+    Returns:
+        - The text with placeholders replaced.
+        :rtype: str
+    """
     if not isinstance(text, str):
         return text
 
-    def repl_square(match):
-        key = match.group(1).strip()
-        return values.get(key, match.group(0))
+    def repl_square(match: re.Match) -> str:
+        """
+        Replace a square-bracket placeholder.
 
-    def repl_angle(match):
-        key = match.group(1).strip()
-        return values.get(key, match.group(0))
+        This function is used as a callback for the `re.sub` function. It
+        is called for each match of the square-bracket placeholder pattern.
+
+        Parameters:
+            - match: The match object containing the placeholder.
+            :type match: re.Match
+
+        Returns:
+            - The placeholder replaced with its corresponding value.
+            :rtype: str
+        """
+        key = match[1].strip()
+        return values.get(key, match[0])
+
+    def repl_angle(match: re.Match) -> str:
+        """
+        Replace an angle-bracket placeholder.
+
+        This function is used as a callback for the `re.sub` function. It
+        is called for each match of the angle-bracket placeholder pattern.
+
+        Parameters:
+            - match: The match object containing the placeholder.
+            :type match: re.Match
+
+        Returns:
+            - The placeholder replaced with its corresponding value.
+            :rtype: str
+        """
+        key = match[1].strip()
+        return values.get(key, match[0])
 
     text = re.sub(r"\[\[([^\]]+)\]\]", repl_square, text)
     text = re.sub(r"<([^>]+)>", repl_angle, text)
@@ -89,33 +176,51 @@ def replace_placeholders(text: str, values: Dict[str, str]) -> str:
 
 
 def load_csvs(csv_dir: str, pattern: str) -> Dict[str, pd.DataFrame]:
-    """Load all CSVs and return {sheet_name: DataFrame} where sheet_name is derived from filename."""
+    """
+    Load all CSVs and return {sheet_name: DataFrame} where sheet_name is derived from filename.
+
+    Using glob to find all CSV files in the specified directory and pattern. `glob` is
+    used instead of `os.listdir` to handle file paths with special characters.
+
+    Parameters:
+        - csv_dir: The directory where the csv files are located.
+        :type csv_dir: str
+
+        - pattern: The pattern to match against the csv files.
+        :type pattern: str
+
+    Returns:
+        - A dictionary of DataFrames where the keys are the sheet names and the values are
+        the DataFrames.
+        :rtype: Dict[str, pd.DataFrame]
+    """
     out = {}
     # Prefer predictable order
     paths = sorted(glob.glob(os.path.join(csv_dir, pattern)))
     for p in paths:
         try:
-            df = pd.read_csv(p)
+            df = pd.read_csv(p, on_bad_lines="warn")
         except UnicodeDecodeError:
-            # Try Excel-compatible encoding fallback
-            df = pd.read_csv(p, encoding="utf-8-sig")
+            # Fallback for different encoding
+            df = pd.read_csv(p, encoding="utf-8-sig", on_bad_lines="warn")
+        except Exception as e:
+            print(f"\n--- ERROR LOADING CSV: {os.path.basename(p)} ---")
+            print(f"Error: {e}")
+            print("---------------------------------------\n")
+            continue
 
-        # Derive "sheet" from filename, e.g. 'Mega-Prompts for Marketing.csv' -> 'Marketing'
+        # Derive "sheet" from filename
         base = os.path.basename(p)
         name = base.replace("Mega-Prompts for ", "").replace(".csv", "").strip()
         out[name] = df
     return out
 
 
-def pick_from_menu(
-    title: str, options: List[str], page_size: int = 15, can_go_back: bool = False
-) -> str:
-    """Display a paginated, searchable menu and return the user's choice."""
-    print(f"\n{title}")
-    if not options:
-        return ""
+# --- Menu Refactor ---
 
-    # Deduplicate and filter out invalid options
+
+def _deduplicate_options(options: List[str]) -> List[str]:
+    """Deduplicate and filter out invalid menu options."""
     seen = set()
     unique = []
     for item in options:
@@ -123,128 +228,210 @@ def pick_from_menu(
         if key and key not in seen and key != "_" and key.lower() != "nan":
             seen.add(key)
             unique.append(key)
+    return unique
 
-    if not unique:
+
+def _display_page(options: List[str], page: int, page_size: int):
+    """Display one page of menu options."""
+    start_idx = page * page_size
+    end_idx = start_idx + page_size
+    current_page_options = options[start_idx:end_idx]
+    for i, opt in enumerate(current_page_options, start=start_idx + 1):
+        print(f"  {i}. {opt}")
+
+
+def _build_prompt(
+    total_options: int, page: int, num_pages: int, can_go_back: bool
+) -> str:
+    """Build the dynamic user input prompt for the menu."""
+    prompt_msg = f"\nChoose 1 - {total_options}"
+    nav_parts = []
+    if num_pages > 1:
+        nav_parts.extend([f"Page {page + 1}/{num_pages}", "N or P for Next / Prev"])
+    if can_go_back:
+        nav_parts.append("'B' for Back")
+    nav_parts.extend(["'E' to Exit", "or Type to Search"])
+    return f"{prompt_msg} ({', '.join(nav_parts)}): "
+
+
+def _handle_search(search_term: str, options: List[str]) -> str | None:
+    """Handle user search, returning a selection, or None if no choice was made."""
+    matches = [opt for opt in options if search_term in opt.lower()]
+    if len(matches) == 1:
+        print(f"→ '{matches[0]}'")
+        return matches[0]
+    if len(matches) > 1:
+        print(
+            f"Found {len(matches)} Matches. Please Be More Specific or Choose from the List."
+        )
+        for i, m in enumerate(matches, 1):
+            print(f"  {i}. {m}")
+        temp_choice = input("\nChoose a Number from the Search Results: ").strip()
+        if temp_choice.isdigit() and 1 <= int(temp_choice) <= len(matches):
+            return matches[int(temp_choice) - 1]
+    else:
+        print("No Match Found. Please Try Again.")
+    return None
+
+
+def _process_menu_choice(
+    choice: str,
+    page: int,
+    num_pages: int,
+    unique_options: List[str],
+    can_go_back: bool,
+) -> Tuple[str, any]:
+    """Process the user's menu choice and return an action and a value."""
+    if choice in {"e", "exit", "q", "quit"}:
+        return "exit", None
+    if choice == "b" and can_go_back:
+        return "back", None
+
+    if choice in {"n", "p"}:
+        if choice == "n" and page < num_pages - 1:
+            page += 1
+        elif choice == "p" and page > 0:
+            page -= 1
+        else:
+            print("Already on the First/Last Page.")
+        return "continue", page
+
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(unique_options):
+            return "select", unique_options[idx - 1]
+        print(f"Invalid number. Please choose between 1 and {len(unique_options)}.")
+        return "continue", page
+
+    if choice:
+        if search_result := _handle_search(choice, unique_options):
+            return "select", search_result
+    else:
+        print("Invalid choice. Please try again.")
+
+    return "continue", page
+
+
+def pick_from_menu(
+    title: str,
+    options: List[str],
+    page_size: int = 15,
+    can_go_back: bool = False,
+) -> str:
+    """Display a paginated, searchable menu and return the user's choice."""
+    print(f"\n{title}")
+    if not options:
+        return ""
+
+    unique_options = _deduplicate_options(options)
+    if not unique_options:
         return ""
 
     page = 0
+    num_pages = (len(unique_options) + page_size - 1) // page_size
+
     while True:
-        # Display current page
-        start_idx = page * page_size
-        end_idx = start_idx + page_size
-        current_page_options = unique[start_idx:end_idx]
-
-        for i, opt in enumerate(current_page_options, start=start_idx + 1):
-            print(f"  {i}. {opt}")
-
-        # Navigation and input prompt
-        prompt_msg = f"Choose 1-{len(unique)}"
-        nav_parts = []
-        if len(unique) > page_size:
-            nav_parts.extend([f"Page {page + 1}/{len(unique) // page_size + 1}", "N/P for next/prev"])
-
-        if can_go_back:
-            nav_parts.append("'B' for back")
-
-        nav_parts.extend(["'E' to exit", "or type to search"])
-        prompt = f"{prompt_msg} ({', '.join(nav_parts)}): "
-
+        _display_page(unique_options, page, page_size)
+        prompt = _build_prompt(len(unique_options), page, num_pages, can_go_back)
         choice = input(prompt).strip().lower()
 
-        if choice in ("e", "exit", "q", "quit"):
+        action, value = _process_menu_choice(
+            choice, page, num_pages, unique_options, can_go_back
+        )
+
+        if action == "exit":
             return "__EXIT__"
-
-        if choice == "n":
-            if end_idx < len(unique):
-                page += 1
-            else:
-                print("Already on the last page.")
-            continue
-        elif choice == "p":
-            if page > 0:
-                page -= 1
-            else:
-                print("Already on the first page.")
-            continue
-        elif choice == "b" and can_go_back:
+        if action == "back":
             return "__BACK__"
-
-        if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(unique):
-                return unique[idx - 1]
-
-        # Search logic
-        matches = [u for u in unique if choice in u.lower()]
-        if len(matches) == 1:
-            print(f"→ '{matches[0]}'")
-            return matches[0]
-        elif len(matches) > 1:
-            print(
-                f"Found {len(matches)} matches. Please be more specific or choose from the list."
-            )
-            # Temporarily display search results in a paginated way
-            for i, m in enumerate(matches, 1):
-                print(f"  {i}. {m}")
-            temp_choice = input("Choose a number from the search results: ").strip()
-            if temp_choice.isdigit() and 1 <= int(temp_choice) <= len(matches):
-                return matches[int(temp_choice) - 1]
-        else:
-            print("No match found. Please try again.")
+        if action == "select":
+            return value
+        if action == "continue":
+            page = value
+            continue
 
 
 def build_system_prompt(
     row: pd.Series, fill_values: Dict[str, str]
 ) -> Tuple[str, Dict[str, str]]:
-    """Build the system prompt with clear formatting."""
-    mega = row.get("Mega-Prompt", "")
-    prompt_name = row.get("Prompt Name", "")
-    desc = row.get("Description ", "") or row.get("Description", "")
-    what = row.get("What This Mega-Prompt Does", "")
-    tips = row.get("Tips", "")
-    how = row.get("How to Use ", "") or row.get("How to Use", "")
-    addl = row.get("Additional Tips", "")
+    """Build the System Prompt."""
+    prompt_data = PromptData.from_series(row)
 
-    placeholder_fields = [mega, desc, what, tips, how, addl]
-    needed = []
-    for t in placeholder_fields:
-        needed.extend(find_placeholders(t))
-    needed = sorted(set(needed))
+    placeholder_fields = [
+        prompt_data.mega_prompt,
+        prompt_data.description,
+        prompt_data.what_this_does,
+        prompt_data.tips,
+        prompt_data.how_to_use,
+        prompt_data.additional_tips,
+    ]
+    needed = sorted(
+        {
+            placeholder
+            for field in placeholder_fields
+            for placeholder in find_placeholders(field)
+        }
+    )
 
     unresolved = {k: None for k in needed if k not in fill_values}
 
-    def maybe(s):
-        s = str(s).strip()
+    def maybe(s: str) -> str:
+        """Return a string if it is not "_'."""
+        s = s.strip()
         return s if s != "_" else ""
 
-    prompt_parts = []
-    if maybe(prompt_name):
-        prompt_parts.append(f"# {prompt_name}\n")
-    if maybe(desc):
-        prompt_parts.append(
-            f"## Description\n{replace_placeholders(desc, fill_values)}\n"
-        )
-    if maybe(what):
-        prompt_parts.append(
-            f"## What This Mega-Prompt Does\n{replace_placeholders(what, fill_values)}\n"
-        )
-    if maybe(tips):
-        prompt_parts.append(f"## Tips\n{replace_placeholders(tips, fill_values)}\n")
-    if maybe(how):
-        prompt_parts.append(
-            f"## How to Use\n{replace_placeholders(how, fill_values)}\n"
-        )
-    if maybe(addl):
-        prompt_parts.append(
-            f"## Additional Tips\n{replace_placeholders(addl, fill_values)}\n"
-        )
+    prompt_parts = [
+        "# " + prompt_data.prompt_name if maybe(prompt_data.prompt_name) else "",
+        (
+            "## Tips\n" + replace_placeholders(prompt_data.tips, fill_values)
+            if maybe(prompt_data.tips)
+            else ""
+        ),
+        (
+            "## How to Use\n"
+            + replace_placeholders(prompt_data.how_to_use, fill_values)
+            if maybe(prompt_data.how_to_use)
+            else ""
+        ),
+        (
+            "## Additional Tips\n"
+            + replace_placeholders(prompt_data.additional_tips, fill_values)
+            if maybe(prompt_data.additional_tips)
+            else ""
+        ),
+    ]
 
-    header_text = "\n".join(prompt_parts)
-    core = replace_placeholders(str(mega), fill_values).strip()
+    header_text = "\n".join(part for part in prompt_parts if part)
+    core = replace_placeholders(prompt_data.mega_prompt, fill_values).strip()
 
     system_prompt = f"{header_text}\n---\n\n{core}" if header_text else core
 
     return system_prompt, unresolved
+
+
+def query_ollama_chat_for_gui(model: str, system_prompt: str, user_msg: str):
+    """Query Ollama and yield response chunks for the GUI."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+        "stream": True,
+    }
+    try:
+        with requests.post(OLLAMA_CHAT_URL, json=payload, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if "message" in obj and "content" in obj["message"]:
+                        yield obj["message"]["content"]
+                except json.JSONDecodeError:
+                    yield line
+    except requests.exceptions.RequestException as e:
+        yield f"\n❌ API Error: {e}"
 
 
 def query_ollama_chat(
@@ -296,150 +483,139 @@ def query_ollama_chat(
                     f.write(content)
 
 
-def main():
-    print("=== Dynamic Ollama Assistant (Interactive, CSV) ===")
-    print(f"CSV folder: {CSV_DIR}")
-    print(f"Model: {DEFAULT_MODEL}")
+def _navigate_menus(
+    data_by_sheet: Dict[str, pd.DataFrame]
+) -> Tuple[pd.Series, str, str] | None:
+    """Handle the nested menu navigation logic."""
+    sheet_names = list(data_by_sheet.keys())
+    picked_sheet = pick_from_menu("Pick a Category:", sheet_names)
+    if picked_sheet in ("__EXIT__", ""):
+        return None
 
-    # Load CSVs
-    data_by_sheet = load_csvs(CSV_DIR, CSV_GLOB)
-    if not data_by_sheet:
-        print(f"❌ No CSVs found with pattern '{CSV_GLOB}' in '{CSV_DIR}'.")
+    while True:
+        df = data_by_sheet[picked_sheet]
+        sub_categories = list(df["Sub-Category"].unique())
+        picked_sub = pick_from_menu(
+            f"Pick a Sub-Category in '{picked_sheet}':",
+            sub_categories,
+            can_go_back=True,
+        )
+
+        if picked_sub == "__BACK__":
+            return _navigate_menus(data_by_sheet)  # Restart navigation
+        if picked_sub in ("__EXIT__", ""):
+            return None
+
+        while True:
+            df_sub = df[df["Sub-Category"] == picked_sub]
+            pages = list(df_sub["Short Description (PAGE NAME)"].unique())
+            picked_page = pick_from_menu(
+                f"Pick a Page in '{picked_sub}':", pages, can_go_back=True
+            )
+
+            if picked_page == "__BACK__":
+                break  # Go back to sub-category selection
+            if picked_page in ("__EXIT__", ""):
+                return None
+
+            row = df.loc[
+                (df["Sub-Category"] == picked_sub)
+                & (df["Short Description (PAGE NAME)"] == picked_page)
+            ].iloc[0]
+            return row, picked_sheet, picked_sub
+
+
+def _process_prompt(
+    row: pd.Series, picked_sheet: str, picked_sub: str, picked_page: str
+):
+    """Handle placeholder filling and the main chat loop for the selected prompt."""
+    print(f"\n✅ Loaded Prompt: \n{row.get('Short Description (PAGE NAME)')}")
+    print(f"   From: {picked_sheet} > {picked_sub}")
+
+    fill_values: Dict[str, str] = {}
+    system_prompt, unresolved = build_system_prompt(row, fill_values)
+
+    if unresolved:
+        print(
+            "\nThis Prompt Needs a Few Details. Press Enter to Leave Any Value Blank"
+            "(will keep placeholder)."
+        )
+        for k in sorted(unresolved.keys()):
+            if val := input(f"  • {k}: ").strip():
+                fill_values[k] = val
+        system_prompt, _ = build_system_prompt(row, fill_values)
+
+    print("\n— System Prompt Preview (First 800 Chars) —")
+    print(system_prompt[:800] + ("..." if len(system_prompt) > 800 else ""))
+
+    model = input(f"\nModel to Use [{DEFAULT_MODEL}]: ").strip() or DEFAULT_MODEL
+
+    output_dir = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_page_name = re.sub(r"[^\w_.)( -]", "", picked_page).strip()
+    output_file = os.path.join(output_dir, f"{timestamp}_{safe_page_name}.md")
+
+    print(f"\n📝 Saving conversation to: {output_file}")
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"--- SYSTEM PROMPT ---\n{system_prompt}")
+
+    print("\nLaunching chat with Ollama.")
+    try:
+        while True:
+            user_msg = input("\n> ").strip()
+            if not user_msg:
+                continue
+
+            query_ollama_chat(model, system_prompt, user_msg, output_file=output_file)
+
+            action_prompt = (
+                "\nNext Action:\n  [C]ontinue Chat\n"
+                + "  [S]tart Over (New Prompt)\n"
+                + "  [E]xit\n> "
+            )
+            while True:
+                next_action = input(action_prompt).strip().lower()
+                if next_action in ["c", "s", "e"]:
+                    break
+                print("Invalid Choice. Please enter 'c', 's', or 'e'.")
+
+            if next_action == "s":
+                print("\n✨ Starting Over...")
+                return  # Return to main loop to start over
+            if next_action == "e":
+                print("\nBye!")
+                sys.exit(0)  # Exit program
+
+    except (KeyboardInterrupt, EOFError):
+        print("\nBye!")
+        sys.exit(0)
+    except requests.exceptions.RequestException as e:
+        print(f"\n❌ API Error: {e}")
+        print("Is the Ollama server running? Try: ollama serve")
         sys.exit(1)
 
-    # --- Main Loop ---
+
+def main():
+    """Orchestrate the dynamic Ollama assistant."""
+    print(f"\n{'-' * 10} Dynamic Ollama Assistant (Interactive, CSV) {'-' * 10}\n")
+    print(f"CSV Folder: {CSV_DIR}")
+    print(f"Default Model: {DEFAULT_MODEL}")
+
+    data_by_sheet = load_csvs(CSV_DIR, CSV_GLOB)
+    if not data_by_sheet:
+        print(f"❌ No CSVs Found with Pattern '{CSV_GLOB}' in '{CSV_DIR}'.")
+        sys.exit(1)
+
     while True:
-        # --- Menu Navigation State ---
-        picked_sheet = None
-        picked_sub = None
-        picked_page = None
-
-        # 1. Pick a sheet (Category)
-        sheet_names = list(data_by_sheet.keys())
-        picked_sheet = pick_from_menu("Pick a Category:", sheet_names)
-        if picked_sheet == "__EXIT__" or not picked_sheet:
+        selection = _navigate_menus(data_by_sheet)
+        if not selection:
             print("\nBye!")
-            return
+            break
 
-        # --- Sub-Category Loop ---
-        while True:
-            df = data_by_sheet[picked_sheet]
-            sub_categories = list(df["Sub-Category"].unique())
-            picked_sub = pick_from_menu(
-                f"Pick a Sub-Category in '{picked_sheet}':",
-                sub_categories,
-                can_go_back=True,
-            )
-
-            if picked_sub == "__BACK__":
-                break  # Go back to sheet selection
-            if picked_sub == "__EXIT__" or not picked_sub:
-                print("\nBye!")
-                return
-
-            # --- Page Loop ---
-            while True:
-                df_sub = df[df["Sub-Category"] == picked_sub]
-                pages = list(df_sub["Short Description (PAGE NAME)"].unique())
-                picked_page = pick_from_menu(
-                    f"Pick a Page in '{picked_sub}':", pages, can_go_back=True
-                )
-
-                if picked_page == "__BACK__":
-                    break  # Go back to sub-category selection
-                if picked_page == "__EXIT__" or not picked_page:
-                    print("\nBye!")
-                    return
-
-                # --- Found a page, break out of menu loops ---
-                goto_chat = True
-                break  # Exit page loop
-
-            if locals().get("goto_chat"):
-                break  # Exit sub-category loop
-
-        if not locals().get("goto_chat"):
-            continue  # Go back to the main loop for category selection
-
-        # --- Process the selected page ---
-        row = df.loc[
-            (df["Sub-Category"] == picked_sub)
-            & (df["Short Description (PAGE NAME)"] == picked_page)
-        ].iloc[0]
-
-        print(f"\n✅ Loaded Prompt: {row.get('Short Description (PAGE NAME)')}")
-        print(f"   From: {picked_sheet} > {picked_sub}")
-
-        # Fill placeholders interactively
-        fill_values: Dict[str, str] = {}
-        system_prompt, unresolved = build_system_prompt(row, fill_values)
-
-        if unresolved:
-            print(
-                "\nThis prompt needs a few details. Press Enter to leave any value blank (will keep placeholder)."
-            )
-            for k in list(unresolved.keys()):
-                if val := input(f"  • {k}: ").strip():
-                    fill_values[k] = val
-            system_prompt, unresolved = build_system_prompt(row, fill_values)
-
-        # Preview
-        print("\n— System prompt preview (first 800 chars) —")
-        print(system_prompt[:800] + ("..." if len(system_prompt) > 800 else ""))
-
-        # Let user override model if desired
-        model = input(f"\nModel to use [{DEFAULT_MODEL}]: ").strip() or DEFAULT_MODEL
-
-        # --- Setup Output File ---
-        output_dir = os.path.join(os.path.dirname(__file__), "output")
-        os.makedirs(output_dir, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Sanitize page name for filename
-        safe_page_name = re.sub(r"[^\w_.)( -]", "", picked_page).strip()
-        output_file = os.path.join(output_dir, f"{timestamp}_{safe_page_name}.txt")
-
-        print(f"\n📝 Saving conversation to: {output_file}")
-
-        # Write system prompt to the file initially
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(f"--- SYSTEM PROMPT ---\n{system_prompt}")
-
-        print("\nLaunching chat with Ollama.")
-        try:
-            # Main chat loop
-            while True:
-                user_msg = input("\n> ").strip()
-                if not user_msg:
-                    continue
-
-                query_ollama_chat(
-                    model, system_prompt, user_msg, output_file=output_file
-                )
-
-                # Ask for next action
-                action_prompt = "\nNext action:\n  [C]ontinue chat\n  [S]tart over (new prompt)\n  [E]xit\n> "
-                while True:
-                    next_action = input(action_prompt).strip().lower()
-                    if next_action in ["c", "s", "e"]:
-                        break
-                    print("Invalid choice. Please enter 'c', 's', or 'e'.")
-
-                if next_action == "s":
-                    print("\n✨ Starting over...")
-                    break  # break inner chat loop to start over
-                elif next_action == "e":
-                    print("\nBye!")
-                    return  # exit program
-                # if 'c', just continue to the next iteration of the loop
-
-        except (KeyboardInterrupt, EOFError):
-            print("\nBye!")
-            return  # Exit cleanly
-        except requests.exceptions.RequestException as e:
-            print(f"\n❌ API Error: {e}")
-            print("Is the Ollama server running? Try: ollama serve")
-            sys.exit(1)
+        row, picked_sheet, picked_sub = selection
+        picked_page = row.get("Short Description (PAGE NAME)")
+        _process_prompt(row, picked_sheet, picked_sub, picked_page)
 
 
 if __name__ == "__main__":
