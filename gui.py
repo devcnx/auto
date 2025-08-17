@@ -1,11 +1,17 @@
 """A tkinter-based GUI for the Dynamic Ollama Assistant."""
 
-import tkinter as tk
+import logging
+import os
+import sys
 import threading
-from tkinter import ttk, scrolledtext
+import tkinter as tk
+import warnings
+import time
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import requests
 import pandas as pd
+from docling.document_converter import DocumentConverter
 
 from dynamic_ollama_assistant import (
     load_csvs,
@@ -121,6 +127,19 @@ class UIComponents:
         self.placeholder_frame = ttk.Frame(prompt_frame)
         self.placeholder_frame.pack(fill="x", padx=10, pady=10)
 
+        file_ops_frame = ttk.LabelFrame(content_area, text="File Operations")
+        file_ops_frame.pack(fill="x", pady=5, anchor="n")
+
+        self.upload_button = ttk.Button(
+            file_ops_frame,
+            text="Upload & Parse File",
+            command=self.parent.upload_and_parse_file,
+        )
+        self.upload_button.pack(side="left", padx=5, pady=5)
+
+        self.parsed_file_label = ttk.Label(file_ops_frame, text="No file loaded.")
+        self.parsed_file_label.pack(side="left", padx=5, pady=5, fill="x", expand=True)
+
         chat_frame = ttk.LabelFrame(content_area, text="Chat")
         chat_frame.pack(fill="both", expand=True)
 
@@ -151,6 +170,17 @@ class UIComponents:
         send_button.pack(side="right")
 
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+# Suppress PyTorch MPS pin_memory warnings on macOS
+warnings.filterwarnings(
+    "ignore",
+    message=r".*'pin_memory' argument is set as true but not supported on MPS.*",
+    category=UserWarning,
+)
+
+
 class OllamaGUI(tk.Tk):
     """A GUI for interacting with the Dynamic Ollama Assistant."""
 
@@ -159,12 +189,28 @@ class OllamaGUI(tk.Tk):
         super().__init__()
         self.title("Dynamic Ollama Assistant")
         self.geometry("1200x800")
+        self.parsed_document_content = None
 
-        self.data_by_sheet = load_csvs(CSV_DIR, CSV_GLOB)
+        try:
+            self.data_by_sheet = load_csvs(CSV_DIR, CSV_GLOB)
+        except Exception as e:
+            messagebox.showerror(
+                "Failed to Load Prompts",
+                f"An error occurred while loading the CSV files:\n\n{e}",
+            )
+            sys.exit(1)
+
         self.selected_prompt_row = None
+        self.is_thinking = False
+        self.thinking_animation_id = None
+        self.conversation_history = []  # Track conversation messages
+        self.system_prompt = None  # Store system prompt to avoid regenerating
 
         self.ui = UIComponents(self)
         self.populate_treeview()
+
+        # Warm up Ollama model in the background to reduce first-response latency
+        threading.Thread(target=self._warm_up_model, daemon=True).start()
 
     def expand_all(self):
         """Expand all nodes in the treeview."""
@@ -294,7 +340,12 @@ class OllamaGUI(tk.Tk):
             prompt_data.additional_tips,
         ]
         placeholders = sorted(
-            {p for field in fields_to_check for p in find_placeholders(str(field))}
+            {
+                p
+                for field in fields_to_check
+                for p in find_placeholders(str(field))
+                if p != "parsed_document"
+            }
         )
 
         if not placeholders:
@@ -314,7 +365,9 @@ class OllamaGUI(tk.Tk):
 
     def _populate_description(self):
         """Display the prompt's description if it exists."""
-        description = self.selected_prompt_row.get("Description ") or self.selected_prompt_row.get("Description")
+        description = self.selected_prompt_row.get(
+            "Description "
+        ) or self.selected_prompt_row.get("Description")
         if pd.notna(description) and description.strip():
             self._display_prompt_description(description)
 
@@ -351,10 +404,27 @@ class OllamaGUI(tk.Tk):
         if not user_msg:
             return
 
+        logging.info("Send pressed. is_thinking=%s", self.is_thinking)
+        
+        # Clear input first, then disable
         self.ui.user_input.delete(0, "end")
+        
+        # Disable input while we process to prevent overlapping streams
+        try:
+            self.ui.user_input.config(state="disabled")
+        except Exception:
+            pass
         self.update_chat_history(f"👤 User: {user_msg}\n\n")
+        self.update_chat_history("🤖 Assistant: ")
 
-        thread = threading.Thread(target=self.run_ollama_query, args=(user_msg,))
+        # Start thinking animation
+        self.is_thinking = True
+        self._thinking_animation()
+
+        # Pass document content directly to the thread
+        thread = threading.Thread(
+            target=self.run_ollama_query, args=(user_msg, self.parsed_document_content)
+        )
         thread.start()
 
     def clear_chat(self):
@@ -362,30 +432,91 @@ class OllamaGUI(tk.Tk):
         self.ui.chat_history.config(state="normal")
         self.ui.chat_history.delete("1.0", "end")
         self.ui.chat_history.config(state="disabled")
+        self.conversation_history = []  # Clear conversation history
+        self.system_prompt = None  # Reset system prompt
 
-    def run_ollama_query(self, user_msg):
+    def run_ollama_query(self, user_msg, document_content):
         """Run the Ollama query in a separate thread."""
-        if self.selected_prompt_row is None:
-            self.update_chat_history("🤖 Assistant: Please select a prompt first.\n")
-            return
+        if self.selected_prompt_row is not None:
+            fill_values = {
+                ph: entry.get() for ph, entry in self.ui.placeholder_entries.items()
+            }
+            if document_content:
+                # Truncate very large content to reduce model startup latency
+                content_to_attach = (
+                    document_content[:20000] + "\n\n… [truncated]"
+                    if len(document_content) > 20000
+                    else document_content
+                )
+                logging.info(
+                    "Attaching parsed document content to prompt (%d chars).",
+                    len(content_to_attach),
+                )
+                fill_values["parsed_document"] = content_to_attach
+            else:
+                logging.warning(
+                    "No parsed document content available to attach to prompt."
+                )
+            system_prompt, _ = build_system_prompt(
+                self.selected_prompt_row, fill_values
+            )
+        else:
+            # If no prompt is selected, use a generic system prompt but still allow
+            # for document context to be included.
+            fill_values = {}
+            if document_content:
+                content_to_attach = (
+                    document_content[:20000] + "\n\n… [truncated]"
+                    if len(document_content) > 20000
+                    else document_content
+                )
+                logging.info(
+                    "Attaching parsed document content to general chat (%d chars).",
+                    len(content_to_attach),
+                )
+                fill_values["parsed_document"] = content_to_attach
+            else:
+                logging.warning(
+                    "No parsed document content available for general chat."
+                )
 
-        fill_values = {
-            ph: entry.get() for ph, entry in self.ui.placeholder_entries.items()
-        }
+            # Create a dummy row for build_system_prompt
+            base_prompt = "You are a helpful assistant."
+            if document_content:
+                base_prompt = """You are a helpful assistant with access to a user-provided document. 
 
-        system_prompt, _ = build_system_prompt(self.selected_prompt_row, fill_values)
+When responding to queries:
+- Use the document content to provide accurate, specific answers
+- Quote relevant sections when appropriate
+- If asked to summarize, provide a comprehensive summary of the document
+- If the query relates to the document, prioritize information from the document
+- If the document doesn't contain relevant information, clearly state that"""
+            
+            dummy_row = pd.Series(
+                {
+                    "Mega-Prompt": base_prompt,
+                    "Prompt Name": "General Chat",
+                    "Description": "",
+                    "What This Mega-Prompt Does": "",
+                    "Tips": "",
+                    "How to Use": "",
+                    "Additional Tips": "",
+                }
+            )
+            system_prompt, _ = build_system_prompt(dummy_row, fill_values)
 
-        self.update_chat_history("🤖 Assistant: ")
-        full_response = ""
-        try:
-            for chunk in query_ollama_chat_for_gui(
-                OLLAMA_MODEL, system_prompt, user_msg
-            ):
-                full_response += chunk
-                self.update_chat_history(chunk)
-            self.update_chat_history("\n\n")
-        except requests.exceptions.RequestException as e:
-            self.update_chat_history(f"\n\n❌ API Error: {e}\n\n")
+        # Only generate system prompt for the first message in conversation
+        if not self.system_prompt:
+            self.system_prompt = system_prompt
+            logging.info("Generated initial system prompt for conversation")
+        
+        # Add user message to conversation history
+        self.conversation_history.append({"role": "user", "content": user_msg})
+        
+        # Stream the response in this background thread; UI updates use `after`
+        logging.info("Starting streaming for message")
+        self._clear_and_stream_response(self.system_prompt, user_msg)
+        logging.info("Finished streaming for message")
 
     def update_chat_history(self, message):
         """Update the chat history text widget in a thread-safe way."""
@@ -393,7 +524,7 @@ class OllamaGUI(tk.Tk):
         self.after(0, self._insert_text, message)
 
     def _insert_text(self, message):
-        """Insert text into the chat history widget with appropriate alignment."""
+        """Insert text into the chat historyfrtn widget with appropriate alignment."""
         self.ui.chat_history.config(state="normal")
 
         # Determine the correct tag based on the message sender
@@ -403,7 +534,173 @@ class OllamaGUI(tk.Tk):
         self.ui.chat_history.config(state="disabled")
         self.ui.chat_history.yview("end")
 
+    def upload_and_parse_file(self):
+        """Handle file upload in the main thread and start parsing in a background thread."""
+        file_path = filedialog.askopenfilename(
+            title="Select a file to parse",
+            filetypes=[
+                ("All supported files", "*.pdf;*.docx;*.html;*.md;*.pptx"),
+                ("PDF files", "*.pdf"),
+                ("Word documents", "*.docx"),
+                ("HTML files", "*.html"),
+                ("Markdown files", "*.md"),
+                ("PowerPoint presentations", "*.pptx"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+
+        self.ui.parsed_file_label.config(
+            text=f"Parsing {os.path.basename(file_path)}..."
+        )
+        self.update_idletasks()
+
+        thread = threading.Thread(target=self._run_file_parsing, args=(file_path,))
+        thread.start()
+
+    def _run_file_parsing(self, file_path):
+        """Run the file parsing logic in a separate thread."""
+        logging.info(f"Starting to parse file: {file_path}")
+        try:
+            self._extracted_from__run_file_parsing_5(file_path)
+        except Exception as e:
+            logging.error(f"An error occurred during file parsing: {e}", exc_info=True)
+            self.after(0, self._show_parsing_error, e)
+
+    # TODO Rename this here and in `_run_file_parsing`
+    def _extracted_from__run_file_parsing_5(self, file_path):
+        converter = DocumentConverter()
+        result = converter.convert(file_path)
+
+        content_parts = []
+        if result:
+            # Newer docling may return a list of documents
+            if hasattr(result, "documents") and result.documents:
+                content_parts.extend(
+                    doc.export_to_markdown() for doc in result.documents
+                )
+            # Older/other versions may return a single document
+            elif hasattr(result, "document") and result.document:
+                content_parts.append(result.document.export_to_markdown())
+
+        if content_parts:
+            self.parsed_document_content = "\n\n".join(content_parts)
+            status_message = f"Loaded: {os.path.basename(file_path)}"
+            logging.info(
+                f"Successfully parsed and loaded file. Content length: {len(self.parsed_document_content)}"
+            )
+        else:
+            self.parsed_document_content = ""
+            status_message = (
+                f"Could not extract content from: {os.path.basename(file_path)}"
+            )
+            logging.warning(
+                f"Failed to extract content from {file_path}. ConversionResult had no document(s)."
+            )
+
+        self.after(0, lambda: self.ui.parsed_file_label.config(text=status_message))
+
+    def _show_parsing_error(self, error):
+        """Display parsing error in a thread-safe way."""
+        self.ui.parsed_file_label.config(text="Failed to parse file.")
+        messagebox.showerror(
+            "Parsing Error", f"An error occurred while parsing the file:\n{error}"
+        )
+
+    def _clear_and_stream_response(self, system_prompt, user_msg):
+        """Keep thinking until first chunk, then clear and stream the response from Ollama."""
+        try:
+            full_response = ""
+            first_chunk = True
+            start_time = time.time()
+            for chunk in query_ollama_chat_for_gui(
+                OLLAMA_MODEL, system_prompt, user_msg, self.conversation_history
+            ):
+                if first_chunk:
+                    # Stop the animation and clear the ellipsis once the first chunk arrives
+                    self.is_thinking = False
+
+                    def _clear_ellipsis():
+                        # Find and clear only the thinking dots after the last assistant message
+                        self.ui.chat_history.config(state="normal")
+                        # Get current content and find the last "🤖 Assistant:" 
+                        content = self.ui.chat_history.get("1.0", "end")
+                        last_assistant_pos = content.rfind("🤖 Assistant:")
+                        if last_assistant_pos != -1:
+                            # Find the position after "🤖 Assistant: " and clear only dots/ellipsis
+                            lines = content[:last_assistant_pos].count('\n')
+                            start_pos = f"{lines + 1}.{len('🤖 Assistant: ')}"
+                            # Delete from after the label to end of that line only
+                            line_end_pos = f"{lines + 1}.end"
+                            current_line_content = self.ui.chat_history.get(start_pos, line_end_pos)
+                            if current_line_content.strip() in [".", "..", "..."]:
+                                self.ui.chat_history.delete(start_pos, line_end_pos)
+                        self.ui.chat_history.config(state="disabled")
+
+                    self.after(0, _clear_ellipsis)
+                    ttfb = time.time() - start_time
+                    logging.info("TTFB (time-to-first-byte): %.2fs", ttfb)
+                    first_chunk = False
+
+                full_response += chunk
+                self.update_chat_history(chunk)
+            total_time = time.time() - start_time
+            logging.info("Total stream time: %.2fs", total_time)
+            self.update_chat_history("\n\n")
+            
+            # Add assistant response to conversation history
+            if full_response.strip():
+                self.conversation_history.append({"role": "assistant", "content": full_response.strip()})
+                
+        except requests.exceptions.RequestException as e:
+            self.update_chat_history(f"\n\n❌ API Error: {e}\n\n")
+        finally:
+            # Ensure thinking state is reset even if an error occurs
+            self.is_thinking = False
+            # Re-enable input
+            try:
+                self.ui.user_input.config(state="normal")
+                self.ui.user_input.focus_set()
+            except Exception:
+                pass
+
+    def _warm_up_model(self):
+        """Send a tiny background request to keep the model warm."""
+        try:
+            # Minimal system prompt and user ping
+            sys_prompt = "You are a helpful assistant. Reply with a single dot."
+            for chunk in query_ollama_chat_for_gui(OLLAMA_MODEL, sys_prompt, "ping"):
+                # Stop after first small chunk
+                break
+            logging.info("Model warm-up completed.")
+        except Exception as e:
+            logging.debug("Model warm-up skipped or failed: %s", e)
+
+    def _thinking_animation(self, dot_count=0):
+        """Animate the thinking ellipsis in the chat window."""
+        if not self.is_thinking:
+            return
+
+        ellipsis = "." * ((dot_count % 3) + 1)
+        if last_assistant_message_start := self.ui.chat_history.search(
+            "🤖 Assistant:", "end-1l", backwards=True, regexp=False
+        ):
+            start_pos = f"{last_assistant_message_start} + 13c"
+            self.ui.chat_history.config(state="normal")
+            self.ui.chat_history.delete(start_pos, "end-1c")
+            self.ui.chat_history.insert(start_pos, ellipsis, "assistant")
+            self.ui.chat_history.config(state="disabled")
+
+        self.thinking_animation_id = self.after(
+            500, lambda: self._thinking_animation(dot_count + 1)
+        )
+
+    def run(self):
+        """Run the main application loop."""
+        self.mainloop()
+
 
 if __name__ == "__main__":
     app = OllamaGUI()
-    app.mainloop()
+    app.run()

@@ -29,6 +29,7 @@ Imports:
 import glob
 import json
 import os
+import logging
 import re
 import sys
 from dataclasses import dataclass
@@ -204,10 +205,8 @@ def load_csvs(csv_dir: str, pattern: str) -> Dict[str, pd.DataFrame]:
             # Fallback for different encoding
             df = pd.read_csv(p, encoding="utf-8-sig", on_bad_lines="warn")
         except Exception as e:
-            print(f"\n--- ERROR LOADING CSV: {os.path.basename(p)} ---")
-            print(f"Error: {e}")
-            print("---------------------------------------\n")
-            continue
+            # Re-raise the exception to be caught by the GUI
+            raise IOError(f"Failed to load {os.path.basename(p)}: {e}") from e
 
         # Derive "sheet" from filename
         base = os.path.basename(p)
@@ -356,6 +355,13 @@ def build_system_prompt(
     """Build the System Prompt."""
     prompt_data = PromptData.from_series(row)
 
+    # Separate document content from other placeholder values
+    parsed_document_content = fill_values.pop("parsed_document", None)
+    if parsed_document_content:
+        logging.info(f"build_system_prompt received document content of length: {len(parsed_document_content)}")
+    else:
+        logging.warning("build_system_prompt did not receive any document content.")
+
     placeholder_fields = [
         prompt_data.mega_prompt,
         prompt_data.description,
@@ -403,25 +409,50 @@ def build_system_prompt(
     header_text = "\n".join(part for part in prompt_parts if part)
     core = replace_placeholders(prompt_data.mega_prompt, fill_values).strip()
 
-    system_prompt = f"{header_text}\n---\n\n{core}" if header_text else core
+    prompt_body = f"{header_text}\n---\n\n{core}" if header_text else core
+
+    system_prompt = prompt_body
+
+    # Prepend the parsed document content if it exists
+    if parsed_document_content:
+        logging.info("Prepending parsed document content to the system prompt.")
+        system_prompt = f"USER-PROVIDED DOCUMENT:\n---BEGIN DOCUMENT---\n{parsed_document_content}\n---END DOCUMENT---\n\n{system_prompt}"
+        logging.info("Final system prompt length: %d chars", len(system_prompt))
+        logging.info("System prompt preview (first 500 chars): %s", system_prompt[:500])
+    else:
+        logging.info("No parsed document content to prepend.")
 
     return system_prompt, unresolved
 
 
-def query_ollama_chat_for_gui(model: str, system_prompt: str, user_msg: str):
+def query_ollama_chat_for_gui(model: str, system_prompt: str, user_msg: str, conversation_history=None):
     """Query Ollama and yield response chunks for the GUI."""
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Add conversation history if provided
+    if conversation_history:
+        messages.extend(conversation_history)
+    
+    # Add current user message
+    messages.append({"role": "user", "content": user_msg})
+    
     payload = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ],
+        "messages": messages,
         "stream": True,
+        # Keep the model loaded to reduce cold-start latency between requests
+        "keep_alive": "10m",
+        # Optional: tune context/window if needed
+        "options": {
+            "num_ctx": 4096
+        },
     }
     try:
-        with requests.post(OLLAMA_CHAT_URL, json=payload, stream=True, timeout=30) as r:
+        r = requests.post(OLLAMA_CHAT_URL, json=payload, stream=True, timeout=30)
+        try:
             r.raise_for_status()
-            for line in r.iter_lines(decode_unicode=True):
+            # Use small chunks so first tokens arrive ASAP
+            for line in r.iter_lines(decode_unicode=True, chunk_size=1):
                 if not line:
                     continue
                 try:
@@ -430,6 +461,12 @@ def query_ollama_chat_for_gui(model: str, system_prompt: str, user_msg: str):
                         yield obj["message"]["content"]
                 except json.JSONDecodeError:
                     yield line
+        finally:
+            # Ensure the HTTP connection is closed even if the caller breaks early
+            try:
+                r.close()
+            except Exception:
+                pass
     except requests.exceptions.RequestException as e:
         yield f"\n❌ API Error: {e}"
 
