@@ -225,3 +225,6 @@ python.mustache
 # Data Directory
 /data
 /output
+
+# Conversations
+/conversations
