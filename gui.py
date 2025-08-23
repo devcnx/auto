@@ -1,9 +1,9 @@
-"""A tkinter-based GUI for the Dynamic Ollama Assistant.
+"""
+A tkinter-based GUI for the Dynamic Ollama Assistant.
 
 Conversation state is persisted to a local file `conversation_state.json` in
 the project root. This file is auto-created by the app on first save/close
 and is ignored by Git by default, so it stays on your machine.
-
 """
 
 import contextlib
@@ -21,24 +21,31 @@ from tkinter import font as tkfont
 
 import requests
 import pandas as pd
-from docling.document_converter import DocumentConverter
 
 from dynamic_ollama_assistant import (
     CSV_DIR,
     CSV_GLOB,
     EXCEL_GLOB,
-    DEFAULT_MODEL as OLLAMA_MODEL,  # Use the setting from the other module
+    DEFAULT_MODEL as OLLAMA_MODEL,
     load_prompt_catalog,
-    query_ollama_chat_for_gui,  # Import the new GUI-specific function
+    query_ollama_chat_for_gui,
     build_system_prompt,
     find_placeholders,
 )
-from web_scraper import scrape_web_content, crawl_website, validate_url
+from web_scraper import scrape_web_content, crawl_website
 from authenticated_scraper import (
     scrape_with_login_sync,
     analyze_login_form_sync,
     navigate_and_scrape_sync,
 )
+from ui_components import UIComponents, ToolTip
+from auth_dialogs import (
+    ManualSelectorDialog,
+    VerificationRequiredDialog,
+    LoginAnalysisDialog,
+    NavigationDialog,
+)
+from file_utils import process_uploaded_file, validate_url, aggregate_parsed_content
 
 
 class Tooltip:
@@ -133,9 +140,6 @@ class UIComponents:
 
         - chat_history: The chat history widget.
         :type chat_history: scrolledtext.ScrolledText
-
-        - user_input: The user input widget.
-        :type user_input: ttk.Entry
     """
 
     def __init__(self, parent):
@@ -166,6 +170,14 @@ class UIComponents:
 
         # --- Content area components ---
         self._create_content_area_widgets(content_area)
+
+    def update_response(self, chunk):
+        """Update the chat display with a chunk of the response."""
+        self.chat_history.config(state=tk.NORMAL)
+        self.chat_history.insert(tk.END, chunk)
+        self.chat_history.see(tk.END)
+        self.chat_history.config(state=tk.DISABLED)
+        self.chat_history.update_idletasks()
 
     def _create_sidebar_widgets(self, sidebar):
         """Create widgets for the sidebar."""
@@ -242,22 +254,22 @@ class UIComponents:
 
         self.url_entry = ttk.Entry(web_row, width=40)
         self.url_entry.pack(side="left", padx=(5, 5), fill="x", expand=True)
-        
+
         # Set up placeholder behavior for URL field
         self.url_placeholder = "Enter URL to scrape..."
         self.url_entry.insert(0, self.url_placeholder)
         self.url_entry.config(foreground="gray")
-        
+
         def url_focus_in(event):
             if self.url_entry.get() == self.url_placeholder:
                 self.url_entry.delete(0, tk.END)
                 self.url_entry.config(foreground="white")
-        
+
         def url_focus_out(event):
             if not self.url_entry.get().strip():
                 self.url_entry.insert(0, self.url_placeholder)
                 self.url_entry.config(foreground="gray")
-        
+
         self.url_entry.bind("<FocusIn>", url_focus_in)
         self.url_entry.bind("<FocusOut>", url_focus_out)
 
@@ -319,7 +331,7 @@ class UIComponents:
             command=self.parent.analyze_login_form,
         )
         self.analyze_button.pack(side="left")
-        
+
         self.navigate_button = ttk.Button(
             auth_row,
             text="Navigate Site",
@@ -327,7 +339,7 @@ class UIComponents:
             state="disabled",  # Initially disabled
         )
         self.navigate_button.pack(side="left", padx=(5, 0))
-        
+
         self.reset_button = ttk.Button(
             auth_row,
             text="Reset",
@@ -2064,6 +2076,12 @@ class OllamaGUI(tk.Tk):
             # Scrape with authentication
             result = scrape_with_login_sync(url, username, password, login_selectors)
 
+            # Check for verification requirements
+            if result.get("requires_manual_verification"):
+                verification_info = result.get("verification_info", {})
+                self._show_verification_required_dialog(verification_info, url)
+                return
+
             if "Error" in result["name"] or "Failed" in result["name"]:
                 messagebox.showerror("Authentication Error", result["content"])
                 return
@@ -2114,11 +2132,15 @@ class OllamaGUI(tk.Tk):
             selectors = analyze_login_form_sync(url)
 
             if "error" in selectors:
-                messagebox.showerror(
-                    "Analysis Error", f"Analysis failed:\n{selectors['error']}"
-                )
-                self.ui.login_analyzed = False
-                self.ui.login_selectors = None
+                if selectors.get("manual_mode"):
+                    # Show manual mode dialog for 403 errors
+                    self._show_manual_selector_dialog(selectors, url)
+                else:
+                    messagebox.showerror(
+                        "Analysis Error", f"Analysis failed:\n{selectors['error']}"
+                    )
+                    self.ui.login_analyzed = False
+                    self.ui.login_selectors = None
             else:
                 self._show_login_analysis(selectors, url)
                 # Mark as analyzed and enable Login & Scrape button
@@ -2135,6 +2157,248 @@ class OllamaGUI(tk.Tk):
         finally:
             self.ui.analyze_button.config(text="Analyze Login", state="normal")
             self._update_auth_button_states()
+
+    def _show_manual_selector_dialog(self, error_info, url):
+        """Show manual selector entry dialog for sites that block automated analysis."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Manual Selector Entry - Site Blocks Analysis")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (700 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (500 // 2)
+        dialog.geometry(f"700x500+{x}+{y}")
+
+        main_frame = ttk.Frame(dialog, padding="10")
+        main_frame.pack(fill="both", expand=True)
+
+        # Error explanation
+        ttk.Label(
+            main_frame,
+            text="⚠️ Site Blocks Automated Analysis",
+            font=("Arial", 14, "bold"),
+            foreground="#ff6b35",
+        ).pack(pady=(0, 10))
+
+        # Error details
+        error_frame = ttk.LabelFrame(main_frame, text="Error Details", padding="10")
+        error_frame.pack(fill="x", pady=(0, 15))
+
+        error_text = tk.Text(
+            error_frame, height=3, wrap="word", background="#2b2b2b", foreground="white"
+        )
+        error_text.pack(fill="x")
+        error_text.insert(
+            "1.0", f"{error_info['error']}\n\n{error_info.get('suggestion', '')}"
+        )
+        error_text.config(state="disabled")
+
+        # Manual entry section
+        manual_frame = ttk.LabelFrame(
+            main_frame, text="Manual CSS Selector Entry", padding="10"
+        )
+        manual_frame.pack(fill="both", expand=True, pady=(0, 15))
+
+        # Instructions
+        ttk.Label(
+            manual_frame,
+            text="Enter CSS selectors manually by inspecting the login page:",
+            font=("Arial", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Selector entries
+        entries = {}
+        common_selectors = error_info.get("common_selectors", {})
+
+        for field, placeholder in [
+            ("username", "Username/Email field selector"),
+            ("password", "Password field selector"),
+            ("submit", "Submit button selector"),
+        ]:
+            field_frame = ttk.Frame(manual_frame)
+            field_frame.pack(fill="x", pady=5)
+
+            ttk.Label(field_frame, text=f"{field.title()}:", width=12).pack(side="left")
+            entry = ttk.Entry(field_frame, width=50)
+            entry.pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+            # Pre-fill with common selector suggestions
+            if field in common_selectors:
+                entry.insert(0, common_selectors[field].split(",")[0].strip())
+
+            entries[field] = entry
+
+        # Help text
+        help_frame = ttk.LabelFrame(
+            manual_frame, text="How to Find Selectors", padding="10"
+        )
+        help_frame.pack(fill="x", pady=(10, 0))
+
+        help_text = tk.Text(
+            help_frame, height=6, wrap="word", background="#2b2b2b", foreground="white"
+        )
+        help_text.pack(fill="x")
+        help_text.insert(
+            "1.0",
+            """1. Open the login page in your browser
+2. Right-click on the username field → "Inspect Element"
+3. Copy the CSS selector (right-click element → Copy → Copy selector)
+4. Repeat for password field and submit button
+5. Common patterns: input[name="email"], #password, button[type="submit"]""",
+        )
+        help_text.config(state="disabled")
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        def use_manual_selectors():
+            selectors = {}
+            for field, entry in entries.items():
+                value = entry.get().strip()
+                if value:
+                    selectors[field] = value
+
+            if len(selectors) >= 2:  # At least username and password
+                self.ui.login_analyzed = True
+                self.ui.login_selectors = selectors
+                self._update_auth_button_states()
+                dialog.destroy()
+                messagebox.showinfo(
+                    "Success", "Manual selectors saved! You can now use Login & Scrape."
+                )
+            else:
+                messagebox.showerror(
+                    "Error", "Please enter at least username and password selectors."
+                )
+
+        def open_browser():
+            import webbrowser
+
+            webbrowser.open(url)
+
+        ttk.Button(button_frame, text="Open Login Page", command=open_browser).pack(
+            side="left"
+        )
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(
+            side="right"
+        )
+        ttk.Button(
+            button_frame, text="Use These Selectors", command=use_manual_selectors
+        ).pack(side="right", padx=(0, 10))
+
+    def _show_verification_required_dialog(self, verification_info, url):
+        """Show dialog when CAPTCHA or human verification is detected."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Human Verification Required")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (600 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (400 // 2)
+        dialog.geometry(f"600x400+{x}+{y}")
+
+        main_frame = ttk.Frame(dialog, padding="10")
+        main_frame.pack(fill="both", expand=True)
+
+        # Warning header
+        ttk.Label(
+            main_frame,
+            text="🤖 Human Verification Detected",
+            font=("Arial", 14, "bold"),
+            foreground="#ff6b35",
+        ).pack(pady=(0, 10))
+
+        # Verification details
+        details_frame = ttk.LabelFrame(
+            main_frame, text="Verification Details", padding="10"
+        )
+        details_frame.pack(fill="x", pady=(0, 15))
+
+        details_text = tk.Text(
+            details_frame,
+            height=4,
+            wrap="word",
+            background="#2b2b2b",
+            foreground="white",
+        )
+        details_text.pack(fill="x")
+
+        details_content = f"Site: {verification_info.get('current_url', url)}\n"
+        details_content += (
+            f"Page Title: {verification_info.get('page_title', 'Unknown')}\n\n"
+        )
+
+        if verification_info.get("content_matches"):
+            details_content += (
+                f"Detected: {', '.join(verification_info['content_matches'][:3])}"
+            )
+
+        details_text.insert("1.0", details_content)
+        details_text.config(state="disabled")
+
+        # Instructions
+        instructions_frame = ttk.LabelFrame(
+            main_frame, text="What This Means", padding="10"
+        )
+        instructions_frame.pack(fill="both", expand=True, pady=(0, 15))
+
+        instructions_text = tk.Text(
+            instructions_frame,
+            height=8,
+            wrap="word",
+            background="#2b2b2b",
+            foreground="white",
+        )
+        instructions_text.pack(fill="x")
+        instructions_text.insert(
+            "1.0",
+            """This site requires human verification (CAPTCHA, "I'm not a robot", etc.) which cannot be automated.
+
+Options to proceed:
+1. Manual Login: Complete the verification manually in your browser, then try scraping
+2. Session Import: If you have valid cookies/session data, import them
+3. Alternative Approach: Some sites offer API access or different login methods
+
+Common verification types detected:
+• reCAPTCHA ("I'm not a robot" checkbox)
+• hCaptcha (image/text challenges)  
+• Cloudflare bot protection
+• Custom verification challenges""",
+        )
+        instructions_text.config(state="disabled")
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        def open_site():
+            import webbrowser
+
+            webbrowser.open(url)
+
+        def try_anyway():
+            """Allow user to attempt login despite verification detection."""
+            dialog.destroy()
+            # Continue with normal login flow
+            messagebox.showinfo(
+                "Proceeding",
+                "Attempting login despite verification detection. Manual intervention may be required.",
+            )
+
+        ttk.Button(button_frame, text="Open Site Manually", command=open_site).pack(
+            side="left"
+        )
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(
+            side="right"
+        )
+        ttk.Button(button_frame, text="Try Login Anyway", command=try_anyway).pack(
+            side="right", padx=(0, 10)
+        )
 
     def _show_login_analysis(self, selectors, url):
         """Show login form analysis results in a dialog."""
@@ -2199,7 +2463,7 @@ class OllamaGUI(tk.Tk):
 
     def _update_auth_button_states(self):
         """Update button states based on authentication workflow state."""
-        if hasattr(self.ui, 'login_analyzed') and self.ui.login_analyzed:
+        if hasattr(self.ui, "login_analyzed") and self.ui.login_analyzed:
             # Login form has been analyzed - enable Login & Scrape
             self.ui.login_scrape_button.config(state="normal")
             # Disable Analyze Login to prevent re-analysis
@@ -2209,9 +2473,9 @@ class OllamaGUI(tk.Tk):
             self.ui.login_scrape_button.config(state="disabled")
             # Enable Analyze Login
             self.ui.analyze_button.config(state="normal")
-            
+
         # If we have an authenticated session, enable navigation
-        if hasattr(self.ui, 'authenticated_session') and self.ui.authenticated_session:
+        if hasattr(self.ui, "authenticated_session") and self.ui.authenticated_session:
             self.ui.navigate_button.config(state="normal")
         else:
             self.ui.navigate_button.config(state="disabled")
@@ -2231,32 +2495,33 @@ class OllamaGUI(tk.Tk):
         self.ui.url_entry.delete(0, tk.END)
         self.ui.url_entry.insert(0, self.ui.url_placeholder)
         self.ui.url_entry.config(foreground="gray")
-        
+
         # Clear credentials
         self._clear_credentials()
-        
+
         # Reset authentication state flags
-        if hasattr(self.ui, 'login_analyzed'):
+        if hasattr(self.ui, "login_analyzed"):
             self.ui.login_analyzed = False
-        if hasattr(self.ui, 'authenticated_session'):
+        if hasattr(self.ui, "authenticated_session"):
             self.ui.authenticated_session = False
-        if hasattr(self.ui, 'login_selectors'):
+        if hasattr(self.ui, "login_selectors"):
             self.ui.login_selectors = None
-            
+
         # Update button states to initial state
         self.ui.analyze_button.config(state="normal")
         self.ui.login_scrape_button.config(state="disabled")
         self.ui.navigate_button.config(state="disabled")
-        
+
         # Update status
         if hasattr(self.ui, "set_conversation_status"):
             self.ui.set_conversation_status("Authentication state reset")
         else:
             self.ui.conversation_status_label.config(text="Authentication state reset")
-        
+
         # Clear any stored session data
         try:
             import os
+
             session_file = "scraper_sessions.json"
             if os.path.exists(session_file):
                 os.remove(session_file)
@@ -2280,7 +2545,10 @@ class OllamaGUI(tk.Tk):
 
     def navigate_authenticated_site(self):
         """Show dialog for navigating authenticated site and scraping additional pages."""
-        if not hasattr(self.ui, 'authenticated_session') or not self.ui.authenticated_session:
+        if (
+            not hasattr(self.ui, "authenticated_session")
+            or not self.ui.authenticated_session
+        ):
             messagebox.showerror("Error", "Please login first using 'Login & Scrape'.")
             return
 
@@ -2304,7 +2572,7 @@ class OllamaGUI(tk.Tk):
         instructions = ttk.Label(
             main_frame,
             text="Enter URLs to navigate and scrape (one per line):",
-            font=("TkDefaultFont", 10, "bold")
+            font=("TkDefaultFont", 10, "bold"),
         )
         instructions.pack(anchor="w", pady=(0, 5))
 
@@ -2313,9 +2581,11 @@ class OllamaGUI(tk.Tk):
         url_frame.pack(fill="both", expand=True, pady=(0, 10))
 
         url_text = tk.Text(url_frame, height=8, wrap="word")
-        url_scrollbar = ttk.Scrollbar(url_frame, orient="vertical", command=url_text.yview)
+        url_scrollbar = ttk.Scrollbar(
+            url_frame, orient="vertical", command=url_text.yview
+        )
         url_text.configure(yscrollcommand=url_scrollbar.set)
-        
+
         url_text.pack(side="left", fill="both", expand=True)
         url_scrollbar.pack(side="right", fill="y")
 
@@ -2343,9 +2613,7 @@ class OllamaGUI(tk.Tk):
 
         wait_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            options_frame,
-            text="Wait between page loads (2 seconds)",
-            variable=wait_var
+            options_frame, text="Wait between page loads (2 seconds)", variable=wait_var
         ).pack(anchor="w", padx=5, pady=5)
 
         # Button frame
@@ -2358,7 +2626,7 @@ class OllamaGUI(tk.Tk):
                 messagebox.showerror("Error", "Please enter at least one URL.")
                 return
 
-            urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
+            urls = [url.strip() for url in urls_text.split("\n") if url.strip()]
             if not urls:
                 messagebox.showerror("Error", "Please enter valid URLs.")
                 return
@@ -2366,8 +2634,12 @@ class OllamaGUI(tk.Tk):
             dialog.destroy()
             self._navigate_and_scrape_urls(urls, wait_var.get())
 
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="right", padx=(5, 0))
-        ttk.Button(button_frame, text="Start Navigation", command=start_navigation).pack(side="right")
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(5, 0)
+        )
+        ttk.Button(
+            button_frame, text="Start Navigation", command=start_navigation
+        ).pack(side="right")
 
     def _navigate_and_scrape_urls(self, urls, wait_between_loads):
         """Navigate to URLs and scrape content using authenticated session."""
@@ -2376,49 +2648,59 @@ class OllamaGUI(tk.Tk):
             if hasattr(self.ui, "set_conversation_status"):
                 self.ui.set_conversation_status("Navigating authenticated site...")
             else:
-                self.ui.conversation_status_label.config(text="Navigating authenticated site...")
+                self.ui.conversation_status_label.config(
+                    text="Navigating authenticated site..."
+                )
             self.update()
 
             # Use the navigation function
             results = navigate_and_scrape_sync(urls, wait_between_loads)
-            
+
             if "error" in results:
-                messagebox.showerror("Navigation Error", f"Error during navigation: {results['error']}")
+                messagebox.showerror(
+                    "Navigation Error", f"Error during navigation: {results['error']}"
+                )
                 return
 
             # Process results
-            scraped_count = len([r for r in results.get('results', []) if 'error' not in r])
+            scraped_count = len(
+                [r for r in results.get("results", []) if "error" not in r]
+            )
             total_count = len(urls)
-            
+
             # Add results to conversation
             summary = f"Navigation completed: {scraped_count}/{total_count} pages scraped successfully."
             if hasattr(self.ui, "set_conversation_status"):
                 self.ui.set_conversation_status(summary)
             else:
                 self.ui.conversation_status_label.config(text=summary)
-            
+
             # Add to conversation
-            self.conversation_history.append({
-                "role": "user",
-                "content": f"Navigated and scraped {scraped_count} authenticated pages"
-            })
-            
+            self.conversation_history.append(
+                {
+                    "role": "user",
+                    "content": f"Navigated and scraped {scraped_count} authenticated pages",
+                }
+            )
+
             # Update parsed files if any content was scraped
             if scraped_count > 0:
-                self.parsed_files.extend([
-                    {
-                        "name": f"Navigation Result {i+1}: {r.get('url', 'Unknown')}",
-                        "content": r.get('content', ''),
-                        "url": r.get('url', ''),
-                        "timestamp": r.get('timestamp', '')
-                    }
-                    for i, r in enumerate(results.get('results', []))
-                    if 'error' not in r and r.get('content')
-                ])
+                self.parsed_files.extend(
+                    [
+                        {
+                            "name": f"Navigation Result {i+1}: {r.get('url', 'Unknown')}",
+                            "content": r.get("content", ""),
+                            "url": r.get("url", ""),
+                            "timestamp": r.get("timestamp", ""),
+                        }
+                        for i, r in enumerate(results.get("results", []))
+                        if "error" not in r and r.get("content")
+                    ]
+                )
                 self._update_parsed_file_label()
-            
+
             messagebox.showinfo("Navigation Complete", summary)
-            
+
         except Exception as e:
             error_msg = f"Navigation failed: {str(e)}"
             messagebox.showerror("Error", error_msg)

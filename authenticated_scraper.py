@@ -49,14 +49,18 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
 """
 
         try:
-            response = "".join(
-                query_ollama_chat_for_gui(
-                    model=DEFAULT_MODEL,
-                    system_prompt="You are a web scraping expert. Analyze HTML and return only valid JSON with CSS selectors.",
-                    user_msg=prompt,
-                    conversation_history=[],
+            try:
+                response = "".join(
+                    query_ollama_chat_for_gui(
+                        model=DEFAULT_MODEL,
+                        system_prompt="You are a web scraping expert. Analyze HTML and return only valid JSON with CSS selectors.",
+                        user_msg=prompt,
+                        conversation_history=[],
+                    )
                 )
-            )
+            except Exception as e:
+                logging.error(f"Failed to query Ollama API: {e}")
+                return {"error": f"AI service unavailable: {str(e)}"}
             # Extract JSON from response - improved parsing
             response = response.strip()
 
@@ -103,6 +107,80 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
             logging.error(f"Failed to analyze login form: {e}")
             return {"error": f"Analysis failed: {str(e)}"}
 
+    async def detect_captcha_or_verification(self, page: Page) -> Dict[str, str]:
+        """Detect if page contains CAPTCHA or human verification challenges."""
+        try:
+            # Common CAPTCHA and verification indicators
+            captcha_selectors = [
+                # reCAPTCHA
+                'iframe[src*="recaptcha"]',
+                ".g-recaptcha",
+                "#recaptcha",
+                "[data-sitekey]",
+                # hCaptcha
+                'iframe[src*="hcaptcha"]',
+                ".h-captcha",
+                # Cloudflare
+                ".cf-challenge-running",
+                ".cf-browser-verification",
+                "#challenge-form",
+                # Generic verification
+                '[class*="captcha"]',
+                '[id*="captcha"]',
+                '[class*="verification"]',
+                '[id*="verification"]',
+                '[class*="challenge"]',
+                '[id*="challenge"]',
+            ]
+
+            verification_found = []
+
+            for selector in captcha_selectors:
+                try:
+                    elements = await page.query_selector_all(selector)
+                    if elements:
+                        verification_found.append(selector)
+                except Exception:
+                    continue
+
+            # Check page content for verification text
+            page_content = await page.content()
+            verification_phrases = [
+                "i'm not a robot",
+                "verify you are human",
+                "complete the security check",
+                "prove you're not a robot",
+                "captcha",
+                "recaptcha",
+                "hcaptcha",
+                "cloudflare",
+                "security challenge",
+                "bot detection",
+                "please verify",
+                "human verification",
+            ]
+
+            content_matches = [
+                phrase
+                for phrase in verification_phrases
+                if phrase.lower() in page_content.lower()
+            ]
+
+            if verification_found or content_matches:
+                return {
+                    "verification_detected": True,
+                    "selectors_found": verification_found,
+                    "content_matches": content_matches,
+                    "page_title": await page.title(),
+                    "current_url": page.url,
+                }
+
+            return {"verification_detected": False}
+
+        except Exception as e:
+            logging.error(f"Error detecting verification: {e}")
+            return {"verification_detected": False, "error": str(e)}
+
     async def scrape_with_login(
         self,
         url: str,
@@ -121,6 +199,17 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
         try:
             # Navigate to the site
             await page.goto(url, wait_until="networkidle")
+
+            # Check for CAPTCHA or human verification challenges
+            verification_check = await self.detect_captcha_or_verification(page)
+            if verification_check.get("verification_detected"):
+                return {
+                    "name": f"Verification Required: {urlparse(url).netloc}",
+                    "content": f"Human verification detected on {url}. Manual intervention required.",
+                    "url": url,
+                    "verification_info": verification_check,
+                    "requires_manual_verification": True,
+                }
 
             # If no selectors provided, try to detect them
             if not login_selectors:
@@ -146,9 +235,9 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                     "input[name='user']",
                     "#email",
                     "#username",
-                    "#user"
+                    "#user",
                 ]
-                
+
                 for selector in username_selectors:
                     try:
                         await page.fill(selector, username, timeout=3000)
@@ -156,14 +245,14 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                         break
                     except Exception:
                         continue
-                
+
                 if not username_filled:
                     return {
                         "name": f"Login Error: {urlparse(url).netloc}",
                         "content": f"Could not find username field. Tried: {', '.join(username_selectors[:3])}",
                         "url": url,
                     }
-                
+
                 # Fill password with fallback options
                 password_filled = False
                 password_selectors = [
@@ -173,9 +262,9 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                     "input[name='pass']",
                     "#password",
                     "#pass",
-                    "#passwd"
+                    "#passwd",
                 ]
-                
+
                 for selector in password_selectors:
                     try:
                         await page.fill(selector, password, timeout=3000)
@@ -183,14 +272,14 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                         break
                     except Exception:
                         continue
-                
+
                 if not password_filled:
                     return {
                         "name": f"Login Error: {urlparse(url).netloc}",
                         "content": f"Could not find password field. Tried: {', '.join(password_selectors[:3])}",
                         "url": url,
                     }
-                
+
                 # Try to submit the login form
                 submit_result = await self._try_submit_button(page, login_selectors)
                 if submit_result:  # If there was an error
@@ -198,19 +287,22 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
 
                 # Wait for navigation or content change
                 await page.wait_for_load_state("networkidle", timeout=15000)
-                
+
                 # Check for 2FA prompt
                 await self._handle_2fa_if_present(page)
-                
+
                 # After 2FA, check if we're already logged in
                 current_url = page.url
                 page_content = await page.content()
-                
+
                 # If URL changed significantly or we don't see login indicators, we're likely logged in
                 login_indicators = ["login", "sign in", "password", "username", "email"]
-                if (current_url != url and 
-                    not any(indicator in page_content.lower() for indicator in login_indicators)):
-                    logging.info("Already authenticated after 2FA - skipping submit button")
+                if current_url != url and not any(
+                    indicator in page_content.lower() for indicator in login_indicators
+                ):
+                    logging.info(
+                        "Already authenticated after 2FA - skipping submit button"
+                    )
                     # Skip the submit button logic since we're already logged in
                 else:
                     # Only try submit button if we're still on a login page
@@ -422,29 +514,46 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
         try:
             # Common 2FA indicators
             twofa_indicators = [
-                "verification code", "two-factor", "2fa", "authenticator",
-                "security code", "verify", "code", "authentication"
+                "verification code",
+                "two-factor",
+                "2fa",
+                "authenticator",
+                "security code",
+                "verify",
+                "code",
+                "authentication",
             ]
-            
+
             page_content = await page.content()
             page_text = page_content.lower()
-            
+
             # Check if 2FA is required
             if any(indicator in page_text for indicator in twofa_indicators):
                 logging.info("2FA detected, waiting for user intervention...")
-                
-                # Wait for user to manually handle 2FA (up to 2 minutes)
-                for _ in range(24):  # 24 * 5 seconds = 2 minutes
+
+                # Wait for user to manually handle 2FA (up to 5 minutes)
+                for i in range(60):  # 60 * 5 seconds = 5 minutes
                     await asyncio.sleep(5)
                     current_content = await page.content()
-                    
+
                     # Check if we've moved past 2FA
-                    if not any(indicator in current_content.lower() for indicator in twofa_indicators):
+                    if not any(
+                        indicator in current_content.lower()
+                        for indicator in twofa_indicators
+                    ):
                         logging.info("2FA completed successfully")
                         return
-                
-                logging.warning("2FA timeout - user may need to complete manually")
-                
+
+                    # Log progress every 30 seconds
+                    if i % 6 == 0:
+                        logging.info(
+                            f"Still waiting for 2FA completion... ({(i+1)*5} seconds elapsed)"
+                        )
+
+                logging.warning(
+                    "2FA timeout after 5 minutes - user may need to complete manually"
+                )
+
         except Exception as e:
             logging.warning(f"Error handling 2FA: {e}")
 
@@ -452,14 +561,14 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
         """Try to click the submit button using various approaches."""
         submit_selector = login_selectors["submit"]
         submit_clicked = False
-        
+
         # First try the detected selector
         try:
             await page.click(submit_selector, timeout=5000)
             submit_clicked = True
         except Exception:
             pass
-        
+
         # If that fails, try common submit button patterns
         if not submit_clicked:
             common_submit_selectors = [
@@ -469,9 +578,9 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                 "button:has-text('Sign in')",
                 "button:has-text('Log in')",
                 "[role='button']:has-text('Login')",
-                "[role='button']:has-text('Sign in')"
+                "[role='button']:has-text('Sign in')",
             ]
-            
+
             for selector in common_submit_selectors:
                 try:
                     await page.click(selector, timeout=3000)
@@ -479,7 +588,7 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                     break
                 except Exception:
                     continue
-        
+
         # If still no success, try pressing Enter on password field
         if not submit_clicked:
             try:
@@ -487,7 +596,7 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                 submit_clicked = True
             except Exception:
                 pass
-        
+
         # Return error if submit failed
         if not submit_clicked:
             return {
@@ -495,92 +604,109 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                 "content": f"Could not find or click submit button. Tried selector: {submit_selector}",
                 "url": page.url,
             }
-        
+
         return None  # Success
 
     async def navigate_and_scrape(
-        self, 
-        base_url: str, 
-        target_urls: list, 
-        username: str = None, 
+        self,
+        base_url: str,
+        target_urls: list,
+        username: str = None,
         password: str = None,
-        login_selectors: Optional[Dict[str, str]] = None
+        login_selectors: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, str]]:
         """Navigate to multiple URLs after authentication and scrape content."""
-        
+
         if not self.browser:
             raise RuntimeError("Browser not initialized. Use async context manager.")
-        
+
         results = []
         page = await self.browser.new_page()
-        
+
         try:
             # If credentials provided, login first
             if username and password:
                 login_result = await self.scrape_with_login(
                     base_url, username, password, login_selectors, save_session=True
                 )
-                
+
                 if "Error" in login_result["name"] or "Failed" in login_result["name"]:
                     return [login_result]
-                
+
                 results.append(login_result)
             else:
                 # Just navigate to base URL and restore session
                 await self._restore_session(page, base_url)
                 await page.goto(base_url, wait_until="networkidle")
-            
+
             # Navigate to each target URL
             for url in target_urls:
                 try:
                     logging.info(f"Navigating to: {url}")
                     await page.goto(url, wait_until="networkidle")
-                    
+
                     # Wait a bit for dynamic content
                     await asyncio.sleep(2)
-                    
+
                     content = await page.content()
                     soup = BeautifulSoup(content, "html.parser")
-                    
+
                     # Clean content
-                    for tag in soup(["nav", "footer", "aside", "script", "style", "header"]):
+                    for tag in soup(
+                        ["nav", "footer", "aside", "script", "style", "header"]
+                    ):
                         tag.decompose()
-                    
+
                     # Extract main content
                     if main_content := (
                         soup.find("main")
                         or soup.find("article")
-                        or soup.find("div", class_=lambda x: x and "content" in x.lower())
+                        or soup.find(
+                            "div", class_=lambda x: x and "content" in x.lower()
+                        )
                     ):
                         text_content = main_content.get_text(separator="\n", strip=True)
                     else:
                         text_content = soup.get_text(separator="\n", strip=True)
-                    
+
                     # Clean up text
-                    lines = [line.strip() for line in text_content.split("\n") if line.strip()]
+                    lines = [
+                        line.strip()
+                        for line in text_content.split("\n")
+                        if line.strip()
+                    ]
                     clean_content = "\n".join(lines)
-                    
+
                     title = soup.find("title")
-                    page_title = title.get_text().strip() if title else f"Page from {urlparse(url).netloc}"
-                    
-                    results.append({
-                        "name": f"Navigated: {page_title}",
-                        "content": clean_content,
-                        "url": url
-                    })
-                    
+                    page_title = (
+                        title.get_text().strip()
+                        if title
+                        else f"Page from {urlparse(url).netloc}"
+                    )
+
+                    results.append(
+                        {
+                            "name": f"Navigated: {page_title}",
+                            "content": clean_content,
+                            "url": url,
+                        }
+                    )
+
                 except Exception as e:
                     logging.warning(f"Failed to navigate to {url}: {e}")
-                    results.append({
-                        "name": f"Navigation Error: {urlparse(url).netloc}",
-                        "content": f"Failed to navigate to {url}: {str(e)}",
-                        "url": url
-                    })
-        
+                    results.append(
+                        {
+                            "name": f"Navigation Error: {urlparse(url).netloc}",
+                            "content": f"Failed to navigate to {url}: {str(e)}",
+                            "url": url,
+                        }
+                    )
+
         finally:
             await page.close()
-        
+
         return results
+
 
 # Synchronous wrapper functions for GUI integration
 def scrape_with_login_sync(
@@ -639,11 +765,37 @@ def navigate_and_scrape_sync(
 def analyze_login_form_sync(url: str) -> Dict[str, str]:
     """Analyze a page to detect login form elements."""
     try:
-        response = requests.get(url, timeout=10)
+        # Add headers to appear more like a real browser
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
 
         scraper = AuthenticatedScraper()
         return scraper.analyze_login_form(response.text)
 
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            return {
+                "error": "Site blocks automated access (403 Forbidden)",
+                "suggestion": "This site prevents automated analysis. Try using Playwright-based analysis or manual selector entry.",
+                "manual_mode": True,
+                "common_selectors": {
+                    "username": "input[type='email'], input[name='username'], input[name='email'], #username, #email",
+                    "password": "input[type='password'], input[name='password'], #password",
+                    "submit": "button[type='submit'], input[type='submit'], button:contains('Sign in'), button:contains('Login')",
+                },
+            }
+        else:
+            return {"error": f"HTTP {e.response.status_code}: {str(e)}"}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Network error: {str(e)}"}
     except Exception as e:
         return {"error": f"Failed to analyze page: {str(e)}"}
