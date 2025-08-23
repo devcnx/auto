@@ -5,6 +5,7 @@ the project root. This file is auto-created by the app on first save/close
 and is ignored by Git by default, so it stays on your machine.
 
 """
+
 import contextlib
 import datetime
 import json
@@ -32,6 +33,7 @@ from dynamic_ollama_assistant import (
     build_system_prompt,
     find_placeholders,
 )
+from web_scraper import scrape_web_content, crawl_website, validate_url
 
 
 class Tooltip:
@@ -60,10 +62,7 @@ class Tooltip:
 
     def _cancel(self):
         if self._after_id is not None:
-            try:
-                self.widget.after_cancel(self._after_id)
-            except Exception:
-                pass
+            self.widget.after_cancel(self._after_id)
             self._after_id = None
 
     def _show_tooltip(self):
@@ -97,10 +96,7 @@ class Tooltip:
 
     def _hide_tooltip(self):
         if self.tipwindow is not None:
-            try:
-                self.tipwindow.destroy()
-            except Exception:
-                pass
+            self.tipwindow.destroy()
             self.tipwindow = None
 
 
@@ -217,28 +213,57 @@ class UIComponents:
         file_ops_frame = ttk.LabelFrame(content_area, text="File Operations")
         file_ops_frame.pack(fill="x", pady=5, anchor="n")
 
-        # Upload button (multi-file capable)
+        # Top row: Upload Files button
+        top_row = ttk.Frame(file_ops_frame)
+        top_row.pack(fill="x", padx=5, pady=5)
+
         self.upload_multi_button = ttk.Button(
-            file_ops_frame,
+            top_row,
             text="Upload Files",
             command=self.parent.upload_and_parse_files,
         )
-        self.upload_multi_button.pack(side="left", padx=5, pady=5)
+        self.upload_multi_button.pack(side="left")
 
-        # Right-side controls first to reserve space
-        self.clear_files_button = ttk.Button(
-            file_ops_frame, text="Clear Files", command=self.parent.clear_uploaded_files
-        )
-        self.clear_files_button.pack(side="right", padx=5, pady=5)
+        # Bottom row: Web scraping controls
+        web_row = ttk.Frame(file_ops_frame)
+        web_row.pack(fill="x", padx=5, pady=(0, 5))
 
-        self.manage_files_button = ttk.Button(
-            file_ops_frame, text="Manage Files", command=self.parent.manage_parsed_files
+        ttk.Label(web_row, text="URL:").pack(side="left")
+
+        self.url_entry = ttk.Entry(web_row, width=40)
+        self.url_entry.pack(side="left", padx=(5, 5), fill="x", expand=True)
+
+        self.scrape_button = ttk.Button(
+            web_row,
+            text="Scrape URL",
+            command=self.parent.scrape_single_url,
         )
-        self.manage_files_button.pack(side="right", padx=5, pady=5)
+        self.scrape_button.pack(side="left", padx=(0, 5))
+
+        self.crawl_button = ttk.Button(
+            web_row,
+            text="Crawl Site",
+            command=self.parent.crawl_website,
+        )
+        self.crawl_button.pack(side="left")
+
+        # Management row: File summary and control buttons
+        mgmt_row = ttk.Frame(file_ops_frame)
+        mgmt_row.pack(fill="x", padx=5, pady=(0, 5))
 
         # File summary label expands in remaining space
-        self.parsed_file_label = ttk.Label(file_ops_frame, text="No file loaded.")
-        self.parsed_file_label.pack(side="left", padx=5, pady=5, fill="x", expand=True)
+        self.parsed_file_label = ttk.Label(mgmt_row, text="No file loaded.")
+        self.parsed_file_label.pack(side="left", fill="x", expand=True)
+
+        self.manage_files_button = ttk.Button(
+            mgmt_row, text="Manage Files", command=self.parent.manage_parsed_files
+        )
+        self.manage_files_button.pack(side="right", padx=(5, 0))
+
+        self.clear_files_button = ttk.Button(
+            mgmt_row, text="Clear Files", command=self.parent.clear_uploaded_files
+        )
+        self.clear_files_button.pack(side="right", padx=(5, 5))
 
         # Conversation Management Section
         conversation_frame = ttk.LabelFrame(
@@ -820,6 +845,24 @@ class OllamaGUI(tk.Tk):
         )
         generate_button.pack(pady=10)
 
+    def _get_combined_document_content(self):
+        """Combine all parsed document content from files and scraped content."""
+        content_parts = []
+
+        # Add legacy parsed_document_content if it exists
+        if getattr(self, "parsed_document_content", None):
+            content_parts.append(self.parsed_document_content)
+
+        # Add content from parsed_files (includes scraped content)
+        if hasattr(self, "parsed_files") and self.parsed_files:
+            for file_data in self.parsed_files:
+                if isinstance(file_data, dict) and "content" in file_data:
+                    name = file_data.get("name", "Unknown")
+                    content = file_data["content"]
+                    content_parts.append(f"=== {name} ===\n{content}")
+
+        return "\n\n".join(content_parts) if content_parts else None
+
     def _generate_system_prompt(self):
         """Build the system prompt using CSV schema and include parsed document if any."""
         if self.selected_prompt_row is None:
@@ -832,8 +875,9 @@ class OllamaGUI(tk.Tk):
             if entry.get().strip()
         }
         # Include parsed document content for use by build_system_prompt
-        if getattr(self, "parsed_document_content", None):
-            fill_values["parsed_document"] = self.parsed_document_content
+        document_content = self._get_combined_document_content()
+        if document_content:
+            fill_values["parsed_document"] = document_content
 
         try:
             system_prompt, _ = build_system_prompt(
@@ -1722,8 +1766,8 @@ class OllamaGUI(tk.Tk):
             return
 
         fill_values = {}
-        if getattr(self, "parsed_document_content", None):
-            fill_values["parsed_document"] = self.parsed_document_content
+        if document_content := self._get_combined_document_content():
+            fill_values["parsed_document"] = document_content
 
         try:
             if self.selected_prompt_row is not None:
@@ -1773,6 +1817,105 @@ class OllamaGUI(tk.Tk):
             + (document or "")
             + "\n---END DOCUMENT---\n"
         )
+
+    def scrape_single_url(self):
+        """Scrape content from a single URL and add it to parsed files."""
+        url = self.ui.url_entry.get().strip()
+
+        if not url:
+            messagebox.showerror("Error", "Please enter a URL to scrape.")
+            return
+
+        if not validate_url(url):
+            messagebox.showerror("Error", "Please enter a valid URL.")
+            return
+
+        try:
+            # Show progress
+            self.ui.scrape_button.config(text="Scraping...", state="disabled")
+            self.update_idletasks()
+
+            # Scrape the content
+            scraped_data = scrape_web_content(url)
+
+            # Add to parsed files
+            self.parsed_files.append(scraped_data)
+
+            # Update UI
+            self._update_parsed_label_from_state()
+            self._save_conversation_state()
+
+            # Clear URL entry
+            self.ui.url_entry.delete(0, tk.END)
+
+            messagebox.showinfo(
+                "Success", f"Successfully scraped: {scraped_data['name']}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Scraping Error", f"Failed to scrape URL:\n{str(e)}")
+        finally:
+            self.ui.scrape_button.config(text="Scrape URL", state="normal")
+
+    def crawl_website(self):
+        """Crawl multiple pages from a website and add them to parsed files."""
+        url = self.ui.url_entry.get().strip()
+
+        if not url:
+            messagebox.showerror("Error", "Please enter a URL to crawl.")
+            return
+
+        if not validate_url(url):
+            messagebox.showerror("Error", "Please enter a valid URL.")
+            return
+
+        # Ask user for crawl settings
+        max_pages = simpledialog.askinteger(
+            "Crawl Settings",
+            "Maximum number of pages to crawl:",
+            initialvalue=5,
+            minvalue=1,
+            maxvalue=20,
+        )
+
+        if not max_pages:
+            return
+
+        try:
+            # Show progress
+            self.ui.crawl_button.config(text="Crawling...", state="disabled")
+            self.update_idletasks()
+
+            # Crawl the website
+            scraped_pages = crawl_website(url, max_pages=max_pages)
+
+            if not scraped_pages:
+                messagebox.showwarning(
+                    "No Content", "No pages could be scraped from the website."
+                )
+                return
+
+            # Add all scraped pages to parsed files
+            self.parsed_files.extend(scraped_pages)
+
+            # Update UI
+            self._update_parsed_label_from_state()
+            self._save_conversation_state()
+
+            # Clear URL entry
+            self.ui.url_entry.delete(0, tk.END)
+
+            messagebox.showinfo(
+                "Success",
+                f"Successfully crawled {len(scraped_pages)} pages from the website.",
+            )
+
+        except Exception as e:
+            messagebox.showerror(
+                "Crawling Error", f"Failed to crawl website:\n{str(e)}"
+            )
+        finally:
+            self.ui.crawl_button.config(text="Crawl Site", state="normal")
 
     def _on_close(self):
         """Handle application close: persist state, cancel animations, and destroy the window."""

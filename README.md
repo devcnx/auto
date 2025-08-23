@@ -11,6 +11,7 @@ An interactive command-line assistant powered by Ollama that dynamically loads a
 * **Interactive Menu System:** A user-friendly, paginated menu allows you to navigate through categories, sub-categories, and individual prompts with ease.
 * **Dynamic Placeholders:** Prompts can contain placeholders like `[[Your Topic]]` or `<Your Goal>`, which you can fill in interactively before starting a chat session.
 * **OCR Integration with Smoldocling:** Populate placeholders by providing a file path to an image or PDF. The tool will automatically extract the text and use it as input.
+* **Web Scraping & Crawling:** Extract content from web pages or crawl entire websites to use as context in your conversations.
 * **Chat with Ollama:** Seamlessly interact with your chosen local LLM (e.g., Llama 3.1) through the Ollama API.
 * **Conversation Logging:** Automatically saves your chat sessions, including the system prompt, to an `output` directory for easy reference.
 
@@ -51,6 +52,7 @@ An interactive command-line assistant powered by Ollama that dynamically loads a
     * Choose a sub-category.
     * Pick a specific prompt.
     * Fill in any required placeholders. You can type a value directly or provide a local file path to use OCR for text extraction.
+    * Optionally scrape web content by entering a URL and clicking "Scrape URL" or "Crawl Site".
     * Start chatting with your local LLM!
 
 ---
