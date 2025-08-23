@@ -44,6 +44,7 @@ CSV_DIR = os.environ.get(
     "MEGAPROMPTS_CSV_DIR", "/Users/brittaneyperry-morgan/Desktop/auto/data"
 )
 CSV_GLOB = os.environ.get("MEGAPROMPTS_CSV_GLOB", "Mega-Prompts for *.csv")
+EXCEL_GLOB = os.environ.get("MEGAPROMPTS_XLSX_GLOB", "Mega-Prompts for *.xlsx")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 # --------------------------------------------------------------
@@ -213,6 +214,83 @@ def load_csvs(csv_dir: str, pattern: str) -> Dict[str, pd.DataFrame]:
         name = base.replace("Mega-Prompts for ", "").replace(".csv", "").strip()
         out[name] = df
     return out
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure all EXPECTED_COLUMNS exist in the DataFrame."""
+    for col in EXPECTED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    # Keep column order mostly stable; missing will be added at end in pandas
+    return df
+
+
+def load_excels(xlsx_dir: str, pattern: str) -> Dict[str, pd.DataFrame]:
+    """
+    Load Excel workbooks, each sheet becomes a category. If multiple workbooks
+    contain the same sheet name, concatenate rows.
+
+    Returns {sheet_name: DataFrame}.
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    paths = sorted(glob.glob(os.path.join(xlsx_dir, pattern)))
+    for p in paths:
+        try:
+            xls = pd.ExcelFile(p, engine=None)  # use default engine (openpyxl for .xlsx)
+        except Exception as e:
+            raise IOError(f"Failed to open {os.path.basename(p)}: {e}") from e
+        for sheet in xls.sheet_names:
+            try:
+                df = xls.parse(sheet)
+                df = _normalize_columns(df)
+            except Exception as se:
+                logging.warning("Skipping sheet '%s' in '%s': %s", sheet, os.path.basename(p), se)
+                continue
+            existing = out.get(sheet)
+            if existing is None:
+                out[sheet] = df
+            else:
+                try:
+                    out[sheet] = pd.concat([existing, df], ignore_index=True)
+                except Exception:
+                    # As a fallback, try aligning columns
+                    all_cols = list({*existing.columns, *df.columns})
+                    out[sheet] = pd.concat([existing.reindex(columns=all_cols), df.reindex(columns=all_cols)], ignore_index=True)
+    return out
+
+
+def load_prompt_catalog(csv_dir: str, csv_glob: str, excel_glob: str) -> Dict[str, pd.DataFrame]:
+    """Merge CSV- and Excel-derived catalogs into a single {category: DataFrame}."""
+    merged: Dict[str, pd.DataFrame] = {}
+    try:
+        csv_map = load_csvs(csv_dir, csv_glob)
+    except Exception as e:
+        logging.warning("CSV load error: %s", e)
+        csv_map = {}
+    try:
+        xls_map = load_excels(csv_dir, excel_glob)
+    except Exception as e:
+        logging.warning("Excel load error: %s", e)
+        xls_map = {}
+
+    # Start with CSVs
+    for k, df in csv_map.items():
+        merged[k] = _normalize_columns(df.copy())
+
+    # Merge Excels by sheet name
+    for k, df in xls_map.items():
+        if k in merged:
+            try:
+                merged[k] = pd.concat([merged[k], _normalize_columns(df)], ignore_index=True)
+            except Exception:
+                cols = list({*merged[k].columns, *df.columns})
+                merged[k] = pd.concat([
+                    merged[k].reindex(columns=cols),
+                    df.reindex(columns=cols),
+                ], ignore_index=True)
+        else:
+            merged[k] = _normalize_columns(df)
+    return merged
 
 
 # --- Menu Refactor ---
