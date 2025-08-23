@@ -55,6 +55,16 @@ An interactive command-line assistant powered by Ollama that dynamically loads a
 
 ---
 
+## Conversation State
+
+The app stores your session (chat history, context preferences, and parsed files) in a local file named `conversation_state.json` in the project root.
+
+- You do not need to create this file; it is created automatically on first save/close.
+- It is ignored by Git and stays on your machine.
+- To reset your session, close the app and delete `conversation_state.json`.
+
+---
+
 ## 📂 CSV File Structure
 
 This script is designed to read prompt data from `.csv` files located in the `/data` directory. To use your own prompts, you must create one or more CSV files that follow a specific structure and naming convention.

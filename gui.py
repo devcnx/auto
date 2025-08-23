@@ -1,5 +1,10 @@
-"""A tkinter-based GUI for the Dynamic Ollama Assistant."""
+"""A tkinter-based GUI for the Dynamic Ollama Assistant.
 
+Conversation state is persisted to a local file `conversation_state.json` in
+the project root. This file is auto-created by the app on first save/close
+and is ignored by Git by default, so it stays on your machine.
+
+"""
 import contextlib
 import datetime
 import json
