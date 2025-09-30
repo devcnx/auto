@@ -1,10 +1,13 @@
 """Authenticated web scraping with AI-assisted element detection."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
-from typing import Dict, Optional, List
+import inspect
+import random
+from typing import Dict, Optional, List, Any, Callable, Awaitable
 from urllib.parse import urlparse
 
 import requests
@@ -20,17 +23,103 @@ class AuthenticatedScraper:
     def __init__(self):
         self.browser: Optional[Browser] = None
         self.sessions_file = "scraper_sessions.json"
+        self.playwright_cm = None
+        self.playwright = None
+        self.remote_endpoint = os.getenv("PLAYWRIGHT_REMOTE_ENDPOINT")
 
     async def __aenter__(self):
         """Async context manager entry."""
-        playwright = await async_playwright().__aenter__()
-        self.browser = await playwright.chromium.launch(headless=False)
+        self.playwright_cm = async_playwright()
+        self.playwright = await self.playwright_cm.__aenter__()
+        if self.remote_endpoint:
+            try:
+                self.browser = await self.playwright.chromium.connect_over_cdp(self.remote_endpoint)
+            except Exception as exc:
+                logging.error("Failed to connect to remote browser at %s: %s", self.remote_endpoint, exc)
+                raise
+        else:
+            self.browser = await self.playwright.chromium.launch(headless=False)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
-        if self.browser:
+        if self.browser and not self.remote_endpoint:
             await self.browser.close()
+        if self.playwright_cm:
+            await self.playwright_cm.__aexit__(exc_type, exc_val, exc_tb)
+
+    def set_remote_endpoint(self, endpoint: Optional[str]):
+        """Update the remote debugging endpoint."""
+        self.remote_endpoint = endpoint
+
+    @staticmethod
+    def apply_remote_endpoint(endpoint: Optional[str]):
+        if endpoint:
+            os.environ["PLAYWRIGHT_REMOTE_ENDPOINT"] = endpoint
+        else:
+            os.environ.pop("PLAYWRIGHT_REMOTE_ENDPOINT", None)
+
+    async def _generate_page_analysis(
+        self,
+        url: str,
+        clean_content: str,
+        include_followups: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Use the LLM to summarize page content and suggest follow-ups."""
+
+        if not clean_content.strip():
+            return None
+
+        truncated = clean_content[:4000]
+        system_prompt = (
+            "You are an analytical research assistant helping a user understand web pages. "
+            "Provide clear, structured insights suitable for decision-making."
+        )
+
+        followup_instructions = (
+            "\n3. Provide up to three follow-up research questions that would help gather "
+            "more context or confirm details."
+            if include_followups
+            else ""
+        )
+
+        user_msg = (
+            f"URL: {url}\n\n"
+            "Analyze the following page content. Respond in Markdown with the sections:\n"
+            "1. Summary (bullet list with at most 3 bullets).\n"
+            "2. Key Data Points (list important numbers, addresses, names, etc.)."
+            f"{followup_instructions}\n\n"
+            "CONTENT:\n"
+            f"{truncated}"
+        )
+
+        def _run_model() -> Optional[str]:
+            try:
+                chunks: List[str] = []
+                for chunk in query_ollama_chat_for_gui(
+                    model=DEFAULT_MODEL,
+                    system_prompt=system_prompt,
+                    user_msg=user_msg,
+                ):
+                    chunks.append(chunk)
+                return "".join(chunks).strip()
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Failed to generate page analysis for %s: %s", url, exc)
+                return None
+
+        analysis_text = await asyncio.to_thread(_run_model)
+        if not analysis_text:
+            return None
+
+        followups: List[str] = []
+        if include_followups:
+            for line in analysis_text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("-"):
+                    followups.append(stripped.lstrip("-•* "))
+            followups = followups[:3]
+
+        return {"analysis": analysis_text, "followups": followups}
 
     def analyze_login_form(self, html_content: str) -> Dict[str, str]:
         """Use AI to identify login form elements."""
@@ -158,6 +247,7 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
                 "bot detection",
                 "please verify",
                 "human verification",
+                "press & hold",
             ]
 
             content_matches = [
@@ -203,13 +293,17 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
             # Check for CAPTCHA or human verification challenges
             verification_check = await self.detect_captcha_or_verification(page)
             if verification_check.get("verification_detected"):
-                return {
-                    "name": f"Verification Required: {urlparse(url).netloc}",
-                    "content": f"Human verification detected on {url}. Manual intervention required.",
-                    "url": url,
-                    "verification_info": verification_check,
-                    "requires_manual_verification": True,
-                }
+                handled = await self._handle_press_and_hold_challenge(page)
+                if not handled:
+                    return {
+                        "name": f"Verification Required: {urlparse(url).netloc}",
+                        "content": f"Human verification detected on {url}. Manual intervention required.",
+                        "url": url,
+                        "verification_info": verification_check,
+                        "requires_manual_verification": True,
+                    }
+            else:
+                await self._handle_press_and_hold_challenge(page)
 
             # If no selectors provided, try to detect them
             if not login_selectors:
@@ -557,6 +651,70 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
         except Exception as e:
             logging.warning(f"Error handling 2FA: {e}")
 
+    async def _handle_press_and_hold_challenge(self, page: Page) -> bool:
+        """Handle Zillow-style press-and-hold bot verification challenges."""
+        try:
+            button = page.locator("text='Press & Hold'")
+            if await button.count() == 0:
+                return False
+
+            # Wait for the button to be visible
+            await button.first.wait_for(state="visible", timeout=5000)
+            bbox = await button.first.bounding_box()
+            if not bbox:
+                return False
+
+            x = bbox["x"] + bbox["width"] / 2
+            y = bbox["y"] + bbox["height"] / 2
+
+            await page.mouse.move(x, y)
+            await page.mouse.down()
+            await asyncio.sleep(3)
+            await page.mouse.up()
+            await page.wait_for_timeout(1000)
+
+            try:
+                await button.first.wait_for(state="hidden", timeout=8000)
+            except Exception:
+                logging.warning("Press & Hold challenge may still be visible.")
+                return False
+
+            logging.info("Press & Hold bot challenge solved automatically.")
+            return True
+        except Exception as exc:
+            logging.warning("Failed to handle Press & Hold challenge: %s", exc)
+            return False
+
+    async def _simulate_human_interaction(self, page: Page):
+        """Introduce randomness to mimic human behavior."""
+        try:
+            viewport = page.viewport_size or {"width": 1280, "height": 720}
+            base_x = random.uniform(50, viewport["width"] - 50)
+            base_y = random.uniform(100, viewport["height"] - 50)
+            await page.mouse.move(base_x, base_y, steps=random.randint(5, 15))
+
+            # Occasionally move to a secondary point to mimic curiosity
+            if random.random() < 0.4:
+                alt_x = min(viewport["width"] - 10, max(10, base_x + random.uniform(-120, 120)))
+                alt_y = min(viewport["height"] - 10, max(10, base_y + random.uniform(-150, 150)))
+                await page.mouse.move(alt_x, alt_y, steps=random.randint(4, 10))
+
+            # Random scroll bursts
+            for _ in range(random.randint(1, 3)):
+                scroll_distance = random.randint(150, 600)
+                await page.mouse.wheel(0, scroll_distance)
+                await asyncio.sleep(random.uniform(0.3, 1.1))
+
+            # Chance to scroll back up slightly
+            if random.random() < 0.3:
+                await page.mouse.wheel(0, -random.randint(80, 200))
+                await asyncio.sleep(random.uniform(0.2, 0.8))
+
+            # Micro idle time to simulate reading
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+        except Exception as exc:
+            logging.debug("Human interaction simulation failed: %s", exc)
+
     async def _try_submit_button(self, page: Page, login_selectors: Dict[str, str]):
         """Try to click the submit button using various approaches."""
         submit_selector = login_selectors["submit"]
@@ -709,6 +867,166 @@ Use specific selectors like input[type="email"], input[name="username"], #passwo
 
 
 # Synchronous wrapper functions for GUI integration
+async def playwright_crawl(
+    start_url: str,
+    max_pages: int = 10,
+    same_domain_only: bool = True,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    login_selectors: Optional[Dict[str, str]] = None,
+    include_ai_summary: bool = False,
+    progress_callback: Optional[
+        Callable[[Dict[str, Any]], Awaitable[bool] | bool]
+    ] = None,
+) -> List[Dict[str, str]]:
+    """Generic Playwright-based crawler that works with or without authentication."""
+
+    async with AuthenticatedScraper() as scraper:
+        results: List[Dict[str, str]] = []
+
+        if username and password:
+            initial = await scraper.scrape_with_login(
+                start_url, username, password, login_selectors, save_session=True
+            )
+            results.append(initial)
+
+            if "Error" in initial.get("name", "") or "Failed" in initial.get("name", ""):
+                return results
+
+        if not scraper.browser:
+            return results
+
+        try:
+            visited: set[str] = set()
+            queue: List[str] = [start_url]
+            parsed_count = 0
+
+            while queue and parsed_count < max_pages:
+                url = queue.pop(0)
+                if url in visited:
+                    continue
+                visited.add(url)
+
+                success = False
+                last_exception: Optional[Exception] = None
+                page = None
+
+                for attempt in range(3):
+                    attempt_page = await scraper.browser.new_page()
+                    attempt_page.set_default_navigation_timeout(45000)
+
+                    try:
+                        await scraper._restore_session(attempt_page, url)
+                        await attempt_page.goto(url, wait_until="domcontentloaded")
+                        await attempt_page.wait_for_timeout(random.randint(1500, 3500))
+                        await scraper._simulate_human_interaction(attempt_page)
+
+                        try:
+                            await attempt_page.wait_for_load_state("networkidle", timeout=20000)
+                        except Exception:
+                            await attempt_page.wait_for_selector("body", timeout=8000)
+
+                        await scraper._handle_press_and_hold_challenge(attempt_page)
+
+                        success = True
+                        page = attempt_page
+                        break
+                    except Exception as exc:
+                        logging.warning(
+                            "Attempt %d failed to load %s: %s",
+                            attempt + 1,
+                            url,
+{{ ... }}
+                        )
+                        last_exception = exc
+                    finally:
+                        if not success:
+                            await attempt_page.close()
+
+                if not success or page is None:
+                    results.append(
+                        {
+                            "name": f"Navigation Timeout: {urlparse(url).netloc}",
+                            "content": f"Failed to load {url} after multiple attempts. Last error: {last_exception}",
+                            "url": url,
+                        }
+                    )
+                    continue
+
+                html = await page.content()
+                soup = BeautifulSoup(html, "html.parser")
+
+                for tag in soup(["nav", "footer", "aside", "script", "style", "header"]):
+                    tag.decompose()
+
+                text_content = soup.get_text(separator="\n", strip=True)
+                clean_lines = [line.strip() for line in text_content.split("\n") if line.strip()]
+                clean_content = "\n".join(clean_lines)
+
+                title = soup.find("title")
+                analysis_info = None
+                if include_ai_summary:
+                    analysis_info = await scraper._generate_page_analysis(
+                        url, clean_content, include_followups=True
+                    )
+
+                result_entry: Dict[str, Any] = {
+                    "name": f"Crawled: {title.get_text().strip() if title else urlparse(url).netloc}",
+                    "content": clean_content,
+                    "url": url,
+                }
+
+                if analysis_info:
+                    result_entry["analysis"] = analysis_info.get("analysis")
+                    result_entry["followups"] = analysis_info.get("followups", [])
+
+                link_hrefs = await page.evaluate(
+                    """
+                    () => Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter(Boolean)
+                    """
+                )
+
+                candidate_links: List[str] = []
+
+                base_domain = urlparse(start_url).netloc
+
+                for href in link_hrefs:
+                    parsed = urlparse(href)
+                    if parsed.scheme not in {"http", "https"}:
+                        continue
+                    if same_domain_only and parsed.netloc != base_domain:
+                        continue
+                    if href in visited or href in queue:
+                        continue
+                    candidate_links.append(href)
+                    queue.append(href)
+
+                result_entry["candidate_links"] = candidate_links[:10]
+
+                results.append(result_entry)
+                parsed_count += 1
+
+                if progress_callback:
+                    callback_result = progress_callback(result_entry)
+                    if inspect.isawaitable(callback_result):
+                        callback_result = await callback_result
+                    if callback_result is False:
+                        await page.close()
+                        break
+
+                if parsed_count >= max_pages:
+                    break
+                await page.close()
+        finally:
+            with contextlib.suppress(Exception):
+                if page is not None:
+                    await page.close()
+
+        return results
+
+
 def scrape_with_login_sync(
     url: str,
     username: str,
@@ -760,6 +1078,35 @@ def navigate_and_scrape_sync(
             )
 
     return asyncio.run(_navigate())
+
+
+def playwright_crawl_sync(
+    start_url: str,
+    max_pages: int = 10,
+    same_domain_only: bool = True,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    login_selectors: Optional[Dict[str, str]] = None,
+    include_ai_summary: bool = False,
+    progress_callback: Optional[
+        Callable[[Dict[str, Any]], Awaitable[bool] | bool]
+    ] = None,
+) -> List[Dict[str, str]]:
+    """Synchronous wrapper for the generic Playwright crawler."""
+
+    async def _crawl():
+        return await playwright_crawl(
+            start_url,
+            max_pages=max_pages,
+            same_domain_only=same_domain_only,
+            username=username,
+            password=password,
+            login_selectors=login_selectors,
+            include_ai_summary=include_ai_summary,
+            progress_callback=progress_callback,
+        )
+
+    return asyncio.run(_crawl())
 
 
 def analyze_login_form_sync(url: str) -> Dict[str, str]:

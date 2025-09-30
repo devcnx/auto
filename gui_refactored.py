@@ -99,14 +99,18 @@ class OllamaGUI(tk.Tk):
         if not user_msg:
             return
 
+        logging.info(f"User sent message ({len(user_msg)} characters): {user_msg[:100]}{'...' if len(user_msg) > 100 else ''}")
+        
         # Clear input
         self.ui.user_input.delete("1.0", tk.END)
 
         # Add user message to conversation
         self.conversation_history.append({"role": "user", "content": user_msg})
         self._update_conversation_display()
+        logging.info(f"Added user message to conversation history. Total messages: {len(self.conversation_history)}")
 
         # Get AI response in background thread
+        logging.info("Starting AI response generation in background thread")
         threading.Thread(
             target=self._get_ai_response,
             args=(user_msg,),
@@ -117,16 +121,24 @@ class OllamaGUI(tk.Tk):
         """Get AI response in background thread."""
         try:
             # Build system prompt with file context
+            logging.info("Building system prompt with file context...")
+            aggregated_content = aggregate_parsed_content(self.parsed_files)
+            content_length = len(aggregated_content) if aggregated_content else 0
+            logging.info(f"Aggregated content length: {content_length:,} characters from {len(self.parsed_files)} files")
+            
             system_prompt = build_system_prompt(
-                parsed_document_content=aggregate_parsed_content(self.parsed_files)
+                parsed_document_content=aggregated_content
             )
+            logging.info(f"System prompt built ({len(system_prompt):,} characters)")
 
             # Update status
             self.ui.set_conversation_status("Thinking...")
+            logging.info(f"Starting Ollama query with model: {OLLAMA_MODEL}")
 
             # Stream response
             full_response = ""
             first_chunk = True
+            chunk_count = 0
 
             for chunk in query_ollama_chat_for_gui(
                 model=OLLAMA_MODEL,
@@ -138,16 +150,20 @@ class OllamaGUI(tk.Tk):
                     self.conversation_history.append({"role": "assistant", "content": ""})
                     self._update_conversation_display()
                     self.ui.set_conversation_status("Responding...")
+                    logging.info("Received first chunk from Ollama, starting response stream")
                     first_chunk = False
 
                 full_response += chunk
+                chunk_count += 1
                 self.conversation_history[-1]["content"] = full_response
                 self._update_conversation_display()
 
+            logging.info(f"AI response completed: {chunk_count} chunks, {len(full_response):,} characters total")
             self.ui.set_conversation_status("Ready")
             self._save_conversation_state()
 
         except Exception as e:
+            logging.error(f"AI response generation failed: {str(e)}")
             error_msg = f"Error: {str(e)}"
             self.conversation_history.append({"role": "assistant", "content": error_msg})
             self._update_conversation_display()
@@ -172,13 +188,16 @@ class OllamaGUI(tk.Tk):
 
     def clear_conversation(self):
         """Clear the conversation history."""
+        previous_count = len(self.conversation_history)
         self.conversation_history = []
         self._update_conversation_display()
         self.ui.set_conversation_status("Conversation cleared")
         self._save_conversation_state()
+        logging.info(f"Conversation cleared: removed {previous_count} messages")
 
     def upload_file(self):
         """Handle file upload."""
+        logging.info("User initiated file upload dialog")
         file_path = filedialog.askopenfilename(
             title="Select a file to upload",
             filetypes=[
@@ -193,13 +212,18 @@ class OllamaGUI(tk.Tk):
         )
 
         if file_path:
+            logging.info(f"User selected file for upload: {file_path}")
             try:
                 result = process_uploaded_file(file_path)
                 self.parsed_files.append(result)
                 self._update_parsed_file_label()
                 self._save_conversation_state()
+                logging.info(f"File upload completed successfully. Total files: {len(self.parsed_files)}")
             except Exception as e:
+                logging.error(f"File upload failed: {str(e)}")
                 messagebox.showerror("Error", f"Failed to process file: {str(e)}")
+        else:
+            logging.info("User cancelled file upload dialog")
 
     def _update_parsed_file_label(self):
         """Update the parsed file label."""
@@ -211,18 +235,24 @@ class OllamaGUI(tk.Tk):
 
     def clear_uploaded_files(self):
         """Clear uploaded files."""
+        previous_count = len(self.parsed_files)
         self.parsed_files = []
         self._update_parsed_file_label()
         self._save_conversation_state()
+        logging.info(f"Uploaded files cleared: removed {previous_count} files")
 
     def scrape_url(self):
         """Scrape content from a URL."""
         url = self.ui.url_entry.get().strip()
+        logging.info(f"User initiated URL scraping for: {url}")
+        
         if not url or url == self.ui.url_placeholder:
+            logging.warning("URL scraping failed: No URL provided")
             messagebox.showerror("Error", "Please enter a URL to scrape.")
             return
 
         if not validate_url(url):
+            logging.warning(f"URL scraping failed: Invalid URL format: {url}")
             messagebox.showerror("Error", "Please enter a valid URL.")
             return
 
@@ -237,41 +267,53 @@ class OllamaGUI(tk.Tk):
                 self.parsed_files.append(result)
                 self._update_parsed_file_label()
                 self._save_conversation_state()
+                logging.info(f"URL scraping completed successfully. Total files: {len(self.parsed_files)}")
                 messagebox.showinfo("Success", f"Successfully scraped content from {url}")
             else:
+                logging.error(f"URL scraping returned no content for: {url}")
                 messagebox.showerror("Error", "Failed to scrape content from the URL.")
         except Exception as e:
+            logging.error(f"URL scraping failed for {url}: {str(e)}")
             messagebox.showerror("Error", f"Failed to scrape URL: {str(e)}")
 
     def analyze_login_form(self):
         """Analyze a page to help identify login form elements."""
         url = self.ui.url_entry.get().strip()
+        logging.info(f"User initiated login form analysis for: {url}")
 
         if not url or url == self.ui.url_placeholder:
+            logging.warning("Login form analysis failed: No URL provided")
             messagebox.showerror("Error", "Please enter a URL to analyze.")
             return
 
         if not validate_url(url):
+            logging.warning(f"Login form analysis failed: Invalid URL format: {url}")
             messagebox.showerror("Error", "Please enter a valid URL.")
             return
 
         try:
             self.ui.analyze_button.config(text="Analyzing...", state="disabled")
+            logging.info("Starting login form analysis...")
             selectors = analyze_login_form_sync(url)
 
             if "error" in selectors:
+                logging.warning(f"Login form analysis encountered error: {selectors.get('error', 'Unknown error')}")
                 if selectors.get("manual_mode"):
+                    logging.info("Switching to manual selector mode")
                     dialog = ManualSelectorDialog(self, selectors, url)
                     dialog.show()
                 else:
+                    logging.error(f"Login form analysis failed: {selectors['error']}")
                     messagebox.showerror("Analysis Error", f"Analysis failed:\n{selectors['error']}")
                     self.ui.login_analyzed = False
                     self.ui.login_selectors = None
             else:
+                logging.info("Login form analysis completed successfully")
                 dialog = LoginAnalysisDialog(self, selectors, url)
                 dialog.show()
 
         except Exception as e:
+            logging.error(f"Login form analysis failed with exception: {str(e)}")
             messagebox.showerror("Analysis Error", f"Failed to analyze login form:\n{str(e)}")
             self.ui.login_analyzed = False
             self.ui.login_selectors = None
@@ -284,6 +326,7 @@ class OllamaGUI(tk.Tk):
         url = self.ui.url_entry.get().strip()
         username = self.ui.username_entry.get().strip()
         password = self.ui.password_entry.get().strip()
+        logging.info(f"User initiated authenticated scraping for: {url} (username: {username[:3]}...)")
 
         if not url or url == self.ui.url_placeholder:
             messagebox.showerror("Error", "Please enter a URL to scrape.")
@@ -303,29 +346,39 @@ class OllamaGUI(tk.Tk):
 
         try:
             self.ui.login_scrape_button.config(text="Logging in...", state="disabled")
+            logging.info("Starting authenticated scraping process...")
             
             login_selectors = self.ui.login_selectors if self.ui.login_analyzed else None
+            if login_selectors:
+                logging.info("Using analyzed login selectors for authentication")
+            else:
+                logging.info("No login selectors available, using automatic detection")
             result = scrape_with_login_sync(url, username, password, login_selectors)
 
             if result.get("requires_manual_verification"):
+                logging.info("Authentication requires manual verification")
                 verification_info = result.get("verification_info", {})
                 dialog = VerificationRequiredDialog(self, verification_info, url)
                 dialog.show()
                 return
 
             if "Error" in result["name"] or "Failed" in result["name"]:
+                logging.error(f"Authentication failed: {result['content']}")
                 messagebox.showerror("Authentication Error", result["content"])
                 return
 
             # Success
+            logging.info("Authentication and scraping completed successfully")
             self.ui.authenticated_session = True
             self._update_auth_button_states()
             self.parsed_files.append(result)
             self._update_parsed_file_label()
             self._save_conversation_state()
+            logging.info(f"Authenticated scraping completed. Total files: {len(self.parsed_files)}")
             messagebox.showinfo("Success", f"Successfully authenticated and scraped {url}")
 
         except Exception as e:
+            logging.error(f"Authenticated scraping failed with exception: {str(e)}")
             messagebox.showerror("Authentication Error", f"Failed to scrape with login:\n{str(e)}")
         finally:
             self.ui.login_scrape_button.config(text="Login & Scrape", state="normal")
@@ -456,11 +509,21 @@ class OllamaGUI(tk.Tk):
 
 def main():
     """Main entry point."""
-    # Setup logging
+    # Setup enhanced logging
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
+        format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+        handlers=[
+            logging.StreamHandler(),  # Console output
+            logging.FileHandler('ollama_assistant.log', mode='a', encoding='utf-8')  # File output
+        ]
     )
+    
+    logging.info("=" * 60)
+    logging.info("Starting Dynamic Ollama Assistant")
+    logging.info(f"Python version: {sys.version}")
+    logging.info(f"Working directory: {os.getcwd()}")
+    logging.info("=" * 60)
 
     # Suppress warnings
     warnings.filterwarnings("ignore", category=UserWarning)

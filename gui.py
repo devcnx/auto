@@ -11,10 +11,16 @@ import datetime
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from tkinter import font as tkfont
@@ -37,8 +43,8 @@ from authenticated_scraper import (
     scrape_with_login_sync,
     analyze_login_form_sync,
     navigate_and_scrape_sync,
+    playwright_crawl_sync,
 )
-from ui_components import UIComponents, ToolTip
 from auth_dialogs import (
     ManualSelectorDialog,
     VerificationRequiredDialog,
@@ -46,6 +52,7 @@ from auth_dialogs import (
     NavigationDialog,
 )
 from file_utils import process_uploaded_file, validate_url, aggregate_parsed_content
+from docling.document_converter import DocumentConverter
 
 
 class Tooltip:
@@ -171,14 +178,6 @@ class UIComponents:
         # --- Content area components ---
         self._create_content_area_widgets(content_area)
 
-    def update_response(self, chunk):
-        """Update the chat display with a chunk of the response."""
-        self.chat_history.config(state=tk.NORMAL)
-        self.chat_history.insert(tk.END, chunk)
-        self.chat_history.see(tk.END)
-        self.chat_history.config(state=tk.DISABLED)
-        self.chat_history.update_idletasks()
-
     def _create_sidebar_widgets(self, sidebar):
         """Create widgets for the sidebar."""
         search_frame = ttk.Frame(sidebar)
@@ -255,6 +254,15 @@ class UIComponents:
         self.url_entry = ttk.Entry(web_row, width=40)
         self.url_entry.pack(side="left", padx=(5, 5), fill="x", expand=True)
 
+        self.remote_endpoint_var = tk.StringVar(value=os.getenv("PLAYWRIGHT_REMOTE_ENDPOINT", ""))
+        self.endpoint_entry = ttk.Entry(web_row, width=38, textvariable=self.remote_endpoint_var)
+        self.endpoint_entry.pack(side="left", padx=(5, 5), fill="x", expand=True)
+        self.endpoint_entry.configure(
+            foreground="white" if self.remote_endpoint_var.get() else "gray"
+        )
+
+        self.remote_endpoint_var.trace_add("write", self._refresh_endpoint_entry_color)
+
         # Set up placeholder behavior for URL field
         self.url_placeholder = "Enter URL to scrape..."
         self.url_entry.insert(0, self.url_placeholder)
@@ -286,6 +294,72 @@ class UIComponents:
             command=self.parent.crawl_website,
         )
         self.crawl_button.pack(side="left")
+
+        self.playwright_crawl_button = ttk.Button(
+            web_row,
+            text="Playwright Crawl",
+            command=self.parent.crawl_site_playwright,
+        )
+        self.playwright_crawl_button.pack(side="left", padx=(5, 0))
+
+        self.manual_verify_button = ttk.Button(
+            web_row,
+            text="Manual Verify",
+            command=self.parent.launch_manual_verification,
+        )
+        self.manual_verify_button.pack(side="left", padx=(5, 0))
+
+        self.remote_toggle_var = tk.BooleanVar(value=bool(os.getenv("PLAYWRIGHT_REMOTE_ENDPOINT")))
+        self.remote_toggle = ttk.Checkbutton(
+            web_row,
+            text="Attach to existing browser",
+            variable=self.remote_toggle_var,
+            command=self.parent._toggle_remote_endpoint,
+        )
+        self.remote_toggle.pack(side="left", padx=(5, 0))
+
+        self.ai_summary_var = tk.BooleanVar(value=True)
+        ai_summary_check = ttk.Checkbutton(
+            web_row,
+            text="AI summary",
+            variable=self.ai_summary_var,
+        )
+        ai_summary_check.pack(side="left", padx=(5, 0))
+
+        remote_controls_row = ttk.Frame(file_ops_frame)
+        remote_controls_row.pack(fill="x", padx=5, pady=(2, 2))
+
+        self.launch_chrome_button = ttk.Button(
+            remote_controls_row,
+            text="Start Chrome",
+            command=self.parent.launch_debug_browser,
+        )
+        self.launch_chrome_button.pack(side="left")
+
+        self.stop_chrome_button = ttk.Button(
+            remote_controls_row,
+            text="Stop Chrome",
+            command=self.parent.stop_debug_browser,
+            state="disabled",
+        )
+        self.stop_chrome_button.pack(side="left", padx=(5, 0))
+
+        self.test_endpoint_button = ttk.Button(
+            remote_controls_row,
+            text="Test Endpoint",
+            command=self.parent.test_remote_debug_endpoint,
+        )
+        self.test_endpoint_button.pack(side="left", padx=(5, 0))
+
+        self.remote_status_label = ttk.Label(
+            file_ops_frame,
+            text="No remote browser configured.",
+            foreground="gray",
+            anchor="w",
+        )
+        self.remote_status_label.pack(fill="x", padx=10, pady=(0, 5))
+
+        self._sync_remote_controls()
 
         # Authentication row: Login credentials and authenticated scraping
         auth_row = ttk.Frame(file_ops_frame)
@@ -504,10 +578,53 @@ class UIComponents:
         chat_frame = ttk.LabelFrame(content_area, text="Chat")
         chat_frame.pack(fill="both", expand=True)
 
-        self.chat_history = scrolledtext.ScrolledText(
-            chat_frame, wrap="word", state="disabled", font=("Proxima Nova Alt", 10)
+        insights_pane = ttk.PanedWindow(chat_frame, orient="vertical")
+        insights_pane.pack(fill="both", expand=True)
+
+        self.crawl_insights_frame = ttk.LabelFrame(insights_pane, text="Live Crawl Insights")
+        insights_pane.add(self.crawl_insights_frame, weight=1)
+
+        self.crawl_insights_text = scrolledtext.ScrolledText(
+            self.crawl_insights_frame,
+            wrap="word",
+            height=12,
+            state="disabled",
+            font=("Proxima Nova Alt", 10),
         )
-        self.chat_history.pack(fill="both", expand=True, padx=10, pady=10)
+        self.crawl_insights_text.pack(fill="both", expand=True, padx=10, pady=10)
+        self.crawl_insights_text.tag_configure(
+            "heading", font=("Proxima Nova Alt", 10, "bold")
+        )
+
+        action_frame = ttk.Frame(self.crawl_insights_frame)
+        action_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.crawl_followup_button = ttk.Button(
+            action_frame,
+            text="Ask LLM about current page",
+            command=self.parent.ask_llm_about_latest_page,
+            state="disabled",
+        )
+        self.crawl_followup_button.pack(side="left")
+
+        self.crawl_stop_button = ttk.Button(
+            action_frame,
+            text="Stop crawl",
+            command=self.parent.stop_crawl,
+            state="disabled",
+        )
+        self.crawl_stop_button.pack(side="left", padx=(10, 0))
+
+        self.crawl_insights_status = ttk.Label(action_frame, text="No active crawl.")
+        self.crawl_insights_status.pack(side="left", padx=(10, 0))
+
+        self.chat_history = scrolledtext.ScrolledText(
+            insights_pane,
+            wrap="word",
+            state="disabled",
+            font=("Proxima Nova Alt", 10),
+        )
+        insights_pane.add(self.chat_history, weight=2)
 
         # Configure tags for chat message alignment
         self.chat_history.tag_configure("user", justify="right")
@@ -591,6 +708,21 @@ class UIComponents:
             self.password_entry.insert(0, "Password")
             self.password_entry.config(show="", foreground="gray")
 
+    def _refresh_endpoint_entry_color(self, *_):
+        """Adjust remote endpoint entry color based on its current value."""
+        value = self.remote_endpoint_var.get().strip()
+        fg = "white" if value else "gray"
+        self.endpoint_entry.configure(foreground=fg)
+
+    def _sync_remote_controls(self):
+        """Update remote debugging widgets to reflect current state."""
+        endpoint = self.remote_endpoint_var.get().strip()
+        self.remote_toggle_var.set(bool(endpoint))
+        self._refresh_endpoint_entry_color()
+        has_process = bool(getattr(self.parent, "chrome_process", None))
+        self.launch_chrome_button.config(state="disabled" if has_process else "normal")
+        self.stop_chrome_button.config(state="normal" if has_process else "disabled")
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -638,6 +770,11 @@ class OllamaGUI(tk.Tk):
         self.current_assistant_line_index: str | None = None
         # Event for stopping in-flight streaming responses
         self.stop_event = threading.Event()
+        # Remote Chrome debugging state
+        self.chrome_process: Optional[subprocess.Popen[str]] | None = None
+        self.chrome_profile_dir: Optional[str] = None
+        self.chrome_endpoint: Optional[str] = None
+        self._remote_endpoint_healthy = False
 
         # Initialize UI first
         self.ui = UIComponents(self)
@@ -655,13 +792,19 @@ class OllamaGUI(tk.Tk):
         # Prompt to save on close and persist state
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def expand_all(self):
-        """Expand all nodes in the treeview."""
-        self._toggle_all(True)
+        existing_endpoint = self.ui.remote_endpoint_var.get().strip()
+        if existing_endpoint:
+            self._update_remote_status(f"Attached to {existing_endpoint}", success=True)
+            self._remote_endpoint_healthy = True
+        else:
+            self._update_remote_status("")
+        self.ui._sync_remote_controls()
 
-    def collapse_all(self):
-        """Collapse all nodes in the treeview."""
-        self._toggle_all(False)
+        # Playwright crawl insight buffer
+        self.crawl_paused = False
+        self.latest_crawl_entry: Optional[Dict[str, Any]] = None
+        self.crawl_result_log: List[Dict[str, Any]] = []
+        self.stop_crawl_flag = False
 
     def _toggle_all(self, open_state: bool):
         """Recursively open or close all items in the treeview."""
@@ -673,6 +816,318 @@ class OllamaGUI(tk.Tk):
         self.ui.prompt_tree.item(parent, open=open_state)
         for child in self.ui.prompt_tree.get_children(parent):
             self._toggle_children(child, open_state)
+
+    def expand_all(self):
+        """Expand every node in the prompt tree."""
+        self._toggle_all(True)
+
+    def collapse_all(self):
+        """Collapse every node in the prompt tree."""
+        self._toggle_all(False)
+
+    def _update_remote_status(self, message: str, *, success: bool = False):
+        """Update the remote connection status label with styling."""
+        color = "#39aa56" if success else "#d9534f"
+        if not message:
+            color = "gray"
+            message = "No remote browser configured."
+        self.ui.remote_status_label.configure(text=message, foreground=color)
+
+    def _set_remote_endpoint(self, endpoint: str | None):
+        """Persist the remote endpoint preference and sync UI state."""
+        if endpoint:
+            os.environ["PLAYWRIGHT_REMOTE_ENDPOINT"] = endpoint
+            self.ui.remote_endpoint_var.set(endpoint)
+            self.ui.remote_toggle_var.set(True)
+            self._update_remote_status(f"Attached to {endpoint}", success=True)
+            self._remote_endpoint_healthy = True
+        else:
+            os.environ.pop("PLAYWRIGHT_REMOTE_ENDPOINT", None)
+            self.ui.remote_endpoint_var.set("")
+            self.ui.remote_toggle_var.set(False)
+            self._update_remote_status("Playwright will launch its own browser.")
+            self._remote_endpoint_healthy = False
+        self.ui._sync_remote_controls()
+
+    def _resolve_chrome_path(self) -> Optional[str]:
+        """Best-effort lookup for a Chrome executable on macOS/Linux."""
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            shutil.which("google-chrome"),
+            shutil.which("chromium"),
+        ]
+
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+    def _build_debugging_command(self, chrome_path: str, port: int, profile_dir: str) -> list[str]:
+        """Construct Chrome launch arguments for remote debugging."""
+        return [
+            chrome_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--disable-popup-blocking",
+        ]
+
+    def launch_debug_browser(self):
+        """Launch a Chrome instance under remote debugging control."""
+        if getattr(self, "chrome_process", None):
+            messagebox.showinfo(
+                "Chrome Already Running",
+                "A debug Chrome session is already active. Use Test Endpoint to verify it.",
+            )
+            return
+
+        chrome_path = self._resolve_chrome_path()
+        if not chrome_path:
+            messagebox.showerror(
+                "Chrome Not Found",
+                "Could not locate Google Chrome. Please install Chrome or set the remote endpoint manually.",
+            )
+            return
+
+        try:
+            port = simpledialog.askinteger(
+                "Remote Debugging Port",
+                "Choose a remote debugging port (default 9222):",
+                initialvalue=9222,
+                minvalue=1024,
+                maxvalue=65535,
+            )
+        except Exception:
+            port = 9222
+
+        if not port:
+            return
+
+        profile_dir = tempfile.mkdtemp(prefix="ollama-chrome-profile-")
+        command = self._build_debugging_command(chrome_path, port, profile_dir)
+
+        try:
+            proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            messagebox.showerror("Launch Failed", f"Failed to start Chrome:\n{exc}")
+            return
+
+        endpoint = f"http://localhost:{port}"
+
+        self.chrome_process = proc
+        self.chrome_profile_dir = profile_dir
+        self.chrome_endpoint = endpoint
+
+        self._set_remote_endpoint(endpoint)
+        self._remote_endpoint_healthy = False
+        self._update_remote_status(
+            f"Chrome running on {endpoint}. Waiting for DevTools…"
+        )
+        self.ui._sync_remote_controls()
+
+    def stop_debug_browser(self):
+        """Terminate the locally launched Chrome remote-debug session."""
+        proc = getattr(self, "chrome_process", None)
+        if not proc:
+            messagebox.showinfo(
+                "Chrome Not Running",
+                "No locally launched Chrome session is currently active.",
+            )
+            return
+
+        profile_dir = self.chrome_profile_dir
+        self.chrome_process = None
+        self.chrome_profile_dir = None
+        self.chrome_endpoint = None
+
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception as exc:
+            logging.warning("Failed to stop Chrome cleanly: %s", exc)
+
+        if profile_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+        self._set_remote_endpoint(None)
+        self._update_remote_status("Chrome debug session stopped.")
+        self.ui._sync_remote_controls()
+
+    def test_remote_debug_endpoint(self):
+        """Ping the configured remote-debug endpoint to confirm availability."""
+        endpoint = self.ui.remote_endpoint_var.get().strip() or getattr(
+            self, "chrome_endpoint", ""
+        )
+        if not endpoint:
+            messagebox.showwarning(
+                "No Endpoint",
+                "Enter a remote debugging endpoint or start Chrome first.",
+            )
+            return
+
+        parsed = urlparse(endpoint)
+        if not parsed.scheme:
+            endpoint = f"http://{endpoint}"
+            parsed = urlparse(endpoint)
+
+        version_url = f"{parsed.scheme}://{parsed.netloc}/json/version"
+
+        try:
+            response = requests.get(version_url, timeout=3)
+            response.raise_for_status()
+            data = response.json()
+            user_agent = data.get("User-Agent", "Unknown UA")
+            browser = data.get("Browser", "Unknown Browser")
+
+            status_text = f"Connected to {parsed.netloc} ({browser})"
+            self._set_remote_endpoint(f"{parsed.scheme}://{parsed.netloc}")
+            self._update_remote_status(status_text, success=True)
+            messagebox.showinfo(
+                "Endpoint Ready",
+                f"Remote debugging endpoint is active.\nBrowser: {browser}\nUser-Agent: {user_agent}",
+            )
+        except requests.RequestException as exc:
+            self._update_remote_status("Failed to connect to remote browser.")
+            messagebox.showerror(
+                "Endpoint Test Failed",
+                f"Could not reach {version_url}.\nDetails: {exc}",
+            )
+        finally:
+            self.ui._sync_remote_controls()
+
+    def _reset_crawl_insights(self):
+        """Clear the live crawl insights panel and reset state."""
+        self.crawl_result_log.clear()
+        self.latest_crawl_entry = None
+        self.crawl_paused = False
+        self.stop_crawl_flag = False
+
+        text_widget = self.ui.crawl_insights_text
+        text_widget.config(state="normal")
+        text_widget.delete("1.0", "end")
+        text_widget.config(state="disabled")
+
+        self.ui.crawl_followup_button.config(state="disabled")
+        self.ui.crawl_stop_button.config(state="disabled")
+        self.ui.crawl_insights_status.config(text="No active crawl.")
+
+    def _append_crawl_insight(self, heading: str, body: str):
+        """Append formatted text to the live crawl insights panel."""
+        text_widget = self.ui.crawl_insights_text
+        text_widget.config(state="normal")
+        text_widget.insert("end", f"{heading}\n", "heading")
+        text_widget.insert("end", f"{body}\n\n")
+        text_widget.see("end")
+        text_widget.config(state="disabled")
+
+    def _handle_crawl_progress(self, entry: Dict[str, Any]) -> bool:
+        """Process each crawl result as it streams in from Playwright."""
+        self.latest_crawl_entry = entry
+        self.crawl_result_log.append(entry)
+        if len(self.crawl_result_log) > 100:
+            self.crawl_result_log.pop(0)
+
+        title = entry.get("name", "Crawled Page")
+        summary_lines: List[str] = []
+
+        if analysis := entry.get("analysis"):
+            summary_lines.append(analysis.strip())
+        elif content := entry.get("content"):
+            snippet = "\n".join(content.splitlines()[:6])
+            if len(content) > 600:
+                snippet = snippet[:600] + "…"
+            summary_lines.append(snippet)
+
+        if followups := entry.get("followups"):
+            formatted = "\n".join(f"- {item}" for item in followups)
+            summary_lines.append("Suggested follow-ups:\n" + formatted)
+
+        if candidates := entry.get("candidate_links"):
+            sample_links = "\n".join(candidates[:5])
+            summary_lines.append("Candidate links:\n" + sample_links)
+
+        body = "\n\n".join(summary_lines) if summary_lines else "No additional details."
+        self._append_crawl_insight(title, body)
+
+        self.ui.crawl_followup_button.config(state="normal")
+        self.ui.crawl_insights_status.config(text=f"Latest page: {entry.get('url', 'unknown')}")
+
+        if self.stop_crawl_flag:
+            self.ui.crawl_insights_status.config(text="Crawl stopping after current page…")
+            return False
+
+        return True
+
+    def ask_llm_about_latest_page(self):
+        """Seed the chat input with a prompt about the most recent crawled page."""
+        if not self.latest_crawl_entry:
+            messagebox.showinfo("No Page", "Run a crawl first to populate insights.")
+            return
+
+        analysis = self.latest_crawl_entry.get("analysis") or ""
+        content = self.latest_crawl_entry.get("content", "")
+        url = self.latest_crawl_entry.get("url", "")
+
+        prompt_parts = [f"Let's discuss the page at {url}."]
+        if analysis:
+            prompt_parts.append("Here is the AI summary:\n" + analysis.strip())
+        else:
+            snippet = "\n".join(content.splitlines()[:6])
+            prompt_parts.append("Here is an excerpt:\n" + snippet)
+
+        prompt_parts.append("Please help me verify key facts and suggest the next steps.")
+
+        user_prompt = "\n\n".join(prompt_parts)
+        self.ui.user_input.delete("1.0", "end")
+        self.ui.user_input.insert("1.0", user_prompt)
+        self.ui.user_input.focus_set()
+
+    def stop_crawl(self):
+        """Signal the in-progress crawl loop to stop after current page."""
+        if not self.crawl_result_log:
+            self.ui.crawl_insights_status.config(text="No crawl is currently running.")
+            return
+        self.stop_crawl_flag = True
+        self.ui.crawl_stop_button.config(state="disabled")
+        self.ui.crawl_insights_status.config(text="Stop requested. Finishing current page…")
+
+    def _log_crawl_insights_to_conversation(self, entries: List[Dict[str, Any]]):
+        """Append crawl summaries to the conversation history and chat log."""
+        if not entries:
+            return
+
+        summary_lines: List[str] = ["Playwright crawl summary:"]
+        for entry in entries[-5:]:
+            url = entry.get("url", "Unknown URL")
+            title = entry.get("name", "Page")
+            analysis = entry.get("analysis")
+            content = entry.get("content", "")
+            if analysis:
+                snippet = analysis.strip().splitlines()
+                snippet_text = snippet[0] if snippet else ""
+            else:
+                snippet_text = " ".join(content.split())[:160]
+            summary_lines.append(f"- **{title}** ({url})\n  {snippet_text}")
+
+        followups_collected: List[str] = []
+        for entry in entries[-5:]:
+            for follow in entry.get("followups", [])[:2]:
+                followups_collected.append(follow)
+        if followups_collected:
+            summary_lines.append("Next-step questions:")
+            for item in followups_collected[:5]:
+                summary_lines.append(f"  - {item}")
+
+        message = "\n".join(summary_lines)
+        self.conversation_history.append({"role": "assistant", "content": message})
+        self.update_chat_history(f"🤖 Assistant: {message}\n\n")
+        self._save_conversation_state()
 
     def clear_placeholder(self, _event=None):
         """Clear placeholder text on focus."""
@@ -1344,6 +1799,7 @@ class OllamaGUI(tk.Tk):
 
     def upload_and_parse_files(self):
         """Select and parse multiple files in a background thread."""
+        logging.info("User initiated file upload dialog")
         file_paths = filedialog.askopenfilenames(
             title="Select files to parse",
             filetypes=[
@@ -1363,7 +1819,17 @@ class OllamaGUI(tk.Tk):
             ],
         )
         if not file_paths:
+            logging.info("User cancelled file selection")
             return
+        
+        logging.info(f"User selected {len(file_paths)} files for processing:")
+        for i, fp in enumerate(file_paths, 1):
+            file_size = os.path.getsize(fp) if os.path.exists(fp) else 0
+            logging.info(f"  {i}. {os.path.basename(fp)} ({file_size:,} bytes)")
+        
+        # Create and show progress window
+        self._create_progress_window(len(file_paths))
+        
         self.ui.parsed_file_label.config(text=f"Parsing {len(file_paths)} file(s)...")
         self.update_idletasks()
         threading.Thread(
@@ -1380,30 +1846,88 @@ class OllamaGUI(tk.Tk):
             self.after(0, self._show_parsing_error, e)
 
     def _run_files_parsing(self, file_paths):
-        """Parse multiple files and aggregate their contents."""
+        """Parse multiple files and aggregate their contents with performance optimizations."""
+        logging.info(f"Starting batch file processing for {len(file_paths)} files")
+        logging.info(f"Files to process: {[os.path.basename(fp) for fp in file_paths]}")
+        
+        # Calculate total file size for progress estimation
+        total_size = sum(os.path.getsize(fp) if os.path.exists(fp) else 0 for fp in file_paths)
+        logging.info(f"Total data to process: {total_size:,} bytes ({total_size / (1024*1024):.1f} MB)")
+        
+        # Performance optimization: Sort files by size (smaller first for faster feedback)
+        file_info = [(fp, os.path.getsize(fp) if os.path.exists(fp) else 0) for fp in file_paths]
+        file_info.sort(key=lambda x: x[1])  # Sort by file size
+        sorted_files = [fp for fp, _ in file_info]
+        
+        logging.info("File processing order (optimized by size):")
+        for i, (fp, size) in enumerate(file_info, 1):
+            logging.info(f"  {i}. {os.path.basename(fp)} ({size:,} bytes)")
+        
         aggregated = []
         parsed_list = []
-        for fp in file_paths:
+        total_files = len(sorted_files)
+        processed_size = 0
+        
+        for i, fp in enumerate(sorted_files, 1):
             try:
+                file_size = os.path.getsize(fp) if os.path.exists(fp) else 0
+                logging.info(f"\n{'='*60}")
+                logging.info(f"PROCESSING FILE {i}/{total_files}: {os.path.basename(fp)}")
+                logging.info(f"File size: {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
+                logging.info(f"Progress: {((i-1)/total_files)*100:.1f}% complete")
+                logging.info(f"Remaining files: {total_files - i + 1}")
+                logging.info(f"{'='*60}")
+                
+                self._update_progress(i-1, total_files, f"Starting {os.path.basename(fp)}...")
+                
+                start_time = time.time()
                 content = self._parse_single_file_collect(fp)
+                end_time = time.time()
+                processing_time = end_time - start_time
+                
+                processed_size += file_size
+                
                 if content:
+                    content_length = len(content)
+                    logging.info(f"✓ SUCCESS: Extracted {content_length:,} characters from {os.path.basename(fp)}")
+                    logging.info(f"Processing time: {processing_time:.2f} seconds")
+                    logging.info(f"Processing speed: {file_size / processing_time / 1024:.1f} KB/s" if processing_time > 0 else "Processing speed: N/A")
+                    logging.info(f"Data processed so far: {processed_size:,} bytes ({(processed_size/total_size)*100:.1f}% of total)")
+                    
                     parsed_list.append(
                         {"name": os.path.basename(fp), "content": content}
                     )
                     header = f"===== FILE: {os.path.basename(fp)} ====="
                     aggregated.append(f"{header}\n\n{content}")
+                    
+                    self._update_progress(i, total_files, f"✓ Completed {os.path.basename(fp)} ({content_length:,} chars)")
+                else:
+                    logging.warning(f"✗ FAILED: No content extracted from {os.path.basename(fp)}")
+                    logging.info(f"Processing time: {processing_time:.2f} seconds (failed)")
+                    self._update_progress(i, total_files, f"✗ Failed {os.path.basename(fp)}")
+                    
             except Exception as e:
+                logging.error(f"✗ ERROR processing {os.path.basename(fp)}: {str(e)}")
                 logging.warning("Skipping file due to parse error: %s (%s)", fp, e)
+                self._update_progress(i, total_files, f"✗ Error in {os.path.basename(fp)}")
 
         # Update state and label on UI thread by appending
         aggregated_text = "\n\n\n".join(aggregated) if aggregated else ""
-        self.after(0, lambda: self._append_parsed_items(parsed_list, aggregated_text))
+        total_content_length = len(aggregated_text)
+        
+        logging.info(f"Batch processing completed: {len(parsed_list)}/{total_files} files processed successfully")
+        logging.info(f"Total content extracted: {total_content_length:,} characters")
+        
+        self.after(0, lambda: self._finalize_file_processing(parsed_list, aggregated_text, len(parsed_list), total_files))
 
     def _parse_file_content(self, file_path):
+        logging.info(f"Starting Docling conversion for: {os.path.basename(file_path)}")
         converter = DocumentConverter()
         result = None
         try:
+            logging.info("Initializing DocumentConverter...")
             result = converter.convert(file_path)
+            logging.info("Docling conversion completed successfully")
         except Exception as e:
             logging.warning(
                 "Docling conversion failed for %s: %s", os.path.basename(file_path), e
@@ -1411,29 +1935,43 @@ class OllamaGUI(tk.Tk):
 
         content_parts = []
         if result:
+            logging.info("Processing Docling conversion result...")
             # Newer docling may return a list of documents
             if hasattr(result, "documents") and result.documents:
+                logging.info(f"Found {len(result.documents)} documents in result")
                 content_parts.extend(
                     doc.export_to_markdown() for doc in result.documents
                 )
+                logging.info("Exported all documents to markdown")
             # Older/other versions may return a single document
             elif hasattr(result, "document") and result.document:
+                logging.info("Found single document in result")
                 content_parts.append(result.document.export_to_markdown())
+                logging.info("Exported document to markdown")
+            else:
+                logging.warning("Docling result contains no usable documents")
 
         # Fallback for PPTX using python-pptx if docling produced no content
         if not content_parts and file_path.lower().endswith(".pptx"):
+            logging.info("Attempting PPTX fallback processing with python-pptx...")
             try:
                 from pptx import Presentation
 
                 prs = Presentation(file_path)
                 slides_text = []
-                for slide in prs.slides:
-                    slides_text.extend(
-                        shape.text for shape in slide.shapes if hasattr(shape, "text")
-                    )
+                slide_count = len(prs.slides)
+                logging.info(f"PPTX contains {slide_count} slides")
+                
+                for i, slide in enumerate(prs.slides, 1):
+                    logging.info(f"Processing slide {i}/{slide_count}")
+                    slide_shapes = [shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()]
+                    slides_text.extend(slide_shapes)
+                    
                 if slides_text:
                     content_parts.append("\n\n".join(slides_text))
-                    logging.info("Parsed PPTX via python-pptx fallback.")
+                    logging.info(f"PPTX fallback successful: extracted text from {slide_count} slides")
+                else:
+                    logging.warning("PPTX fallback found no text content")
             except Exception as e:
                 logging.warning("PPTX fallback failed: %s", e)
 
@@ -1441,66 +1979,96 @@ class OllamaGUI(tk.Tk):
         if not content_parts and (
             file_path.lower().endswith(".xlsx") or file_path.lower().endswith(".xls")
         ):
+            logging.info("Attempting Excel fallback processing with pandas...")
             try:
                 excel = pd.ExcelFile(file_path)
+                sheet_count = len(excel.sheet_names)
+                logging.info(f"Excel file contains {sheet_count} sheets: {excel.sheet_names}")
+                
                 sheet_md_parts = []
-                for sheet in excel.sheet_names:
+                for i, sheet in enumerate(excel.sheet_names, 1):
+                    logging.info(f"Processing sheet {i}/{sheet_count}: '{sheet}'")
                     try:
                         df = excel.parse(sheet)
+                        rows, cols = df.shape
+                        logging.info(f"Sheet '{sheet}' has {rows:,} rows and {cols} columns")
+                        
                         # Limit overly large tables for responsiveness
                         preview = df.head(200)
                         md = preview.to_markdown(index=False)
                         sheet_md = f"# Sheet: {sheet}\n\n{md}"
                         sheet_md_parts.append(sheet_md)
+                        logging.info(f"Successfully processed sheet '{sheet}' (showing first {len(preview)} rows)")
                     except Exception as se:
+                        logging.warning(f"Failed to process sheet '{sheet}': {se}")
                         sheet_md_parts.append(
                             f"# Sheet: {sheet}\n\n(Unable to parse sheet: {se})"
                         )
+                        
                 if sheet_md_parts:
                     content_parts.append("\n\n---\n\n".join(sheet_md_parts))
                     logging.info(
-                        "Parsed Excel via pandas fallback: %d sheet(s)",
+                        "Excel fallback successful: processed %d sheet(s)",
                         len(sheet_md_parts),
                     )
+                else:
+                    logging.warning("Excel fallback found no processable sheets")
             except Exception as e:
                 logging.warning("Excel fallback failed: %s", e)
 
         # Fallback for CSV using pandas if docling produced no content
         if not content_parts and file_path.lower().endswith(".csv"):
+            logging.info("Attempting CSV fallback processing with pandas...")
             try:
                 df = pd.read_csv(file_path, on_bad_lines="skip")
+                total_rows, total_cols = df.shape
+                logging.info(f"CSV file contains {total_rows:,} rows and {total_cols} columns")
+                
                 preview = df.head(500)
                 md = preview.to_markdown(index=False)
                 content_parts.append(f"# CSV Preview (first 500 rows)\n\n{md}")
                 logging.info(
-                    "Parsed CSV via pandas fallback: %s rows previewed", len(preview)
+                    "CSV fallback successful: %s rows previewed out of %s total", len(preview), total_rows
                 )
             except Exception as e:
                 logging.warning("CSV fallback failed: %s", e)
 
         # Fallback for JSON: if array of objects, tabularize; else pretty-print
         if not content_parts and file_path.lower().endswith(".json"):
+            logging.info("Attempting JSON fallback processing...")
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    
                 if isinstance(data, list) and data and isinstance(data[0], dict):
+                    logging.info(f"JSON contains {len(data)} records, converting to table format")
                     df = pd.DataFrame(data)
+                    rows, cols = df.shape
+                    logging.info(f"JSON table has {rows:,} rows and {cols} columns")
+                    
                     preview = df.head(500)
                     md = preview.to_markdown(index=False)
                     content_parts.append(
                         f"# JSON Table Preview (first 500 rows)\n\n{md}"
                     )
+                    logging.info(f"JSON table fallback successful: showing {len(preview)} rows")
                 else:
+                    logging.info("JSON contains non-tabular data, formatting as pretty-printed JSON")
                     pretty = json.dumps(data, indent=2, ensure_ascii=False)[:200000]
                     content_parts.append(f"```json\n{pretty}\n```")
+                    logging.info(f"JSON pretty-print fallback successful: {len(pretty):,} characters")
+                    
                 logging.info(
-                    "Parsed JSON fallback for file: %s", os.path.basename(file_path)
+                    "JSON fallback completed for file: %s", os.path.basename(file_path)
                 )
             except Exception as e:
                 logging.warning("JSON fallback failed: %s", e)
 
         if content_parts:
             content_text = "\n\n".join(content_parts)
+            content_length = len(content_text)
+            logging.info(f"Successfully processed {os.path.basename(file_path)}: {content_length:,} characters extracted")
+            
             item = {"name": os.path.basename(file_path), "content": content_text}
             header = f"===== FILE: {item['name']} =====\n\n{content_text}"
             # Append on UI thread to keep state consistent
@@ -1511,6 +2079,7 @@ class OllamaGUI(tk.Tk):
                 len(content_text),
             )
         else:
+            logging.error(f"All processing methods failed for {os.path.basename(file_path)} - no content extracted")
             logging.warning(
                 "Failed to extract content from %s. ConversionResult had no document(s).",
                 file_path,
@@ -1526,6 +2095,102 @@ class OllamaGUI(tk.Tk):
             )
             self.after(
                 0, lambda: self._set_parsed_label_tooltip(os.path.basename(file_path))
+            )
+
+    def _create_progress_window(self, total_files):
+        """Create and show a progress window for file processing."""
+        self.progress_window = tk.Toplevel(self)
+        self.progress_window.title("Processing Files")
+        self.progress_window.geometry("400x150")
+        self.progress_window.resizable(False, False)
+        
+        # Center the window
+        self.progress_window.transient(self)
+        self.progress_window.grab_set()
+        
+        # Progress label
+        self.progress_label = ttk.Label(
+            self.progress_window, 
+            text=f"Processing 0/{total_files} files...",
+            font=("Arial", 10)
+        )
+        self.progress_label.pack(pady=10)
+        
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(
+            self.progress_window,
+            length=350,
+            mode='determinate',
+            maximum=total_files
+        )
+        self.progress_bar.pack(pady=10)
+        
+        # Status label
+        self.progress_status = ttk.Label(
+            self.progress_window,
+            text="Initializing...",
+            font=("Arial", 9),
+            foreground="gray"
+        )
+        self.progress_status.pack(pady=5)
+        
+        # Cancel button (optional)
+        self.progress_cancel = ttk.Button(
+            self.progress_window,
+            text="Cancel",
+            command=self._cancel_processing
+        )
+        self.progress_cancel.pack(pady=5)
+        
+        self.processing_cancelled = False
+        
+    def _update_progress(self, current, total, status_text):
+        """Update the progress window with current status."""
+        if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
+            self.after(0, lambda: self._update_progress_ui(current, total, status_text))
+            
+    def _update_progress_ui(self, current, total, status_text):
+        """Update progress UI elements on the main thread."""
+        if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
+            self.progress_label.config(text=f"Processing {current}/{total} files...")
+            self.progress_bar['value'] = current
+            self.progress_status.config(text=status_text)
+            self.progress_window.update_idletasks()
+            
+    def _cancel_processing(self):
+        """Cancel the file processing operation."""
+        self.processing_cancelled = True
+        logging.info("User cancelled file processing")
+        if hasattr(self, 'progress_window'):
+            self.progress_window.destroy()
+            
+    def _finalize_file_processing(self, parsed_list, aggregated_text, success_count, total_count):
+        """Finalize the file processing and update UI."""
+        # Close progress window
+        if hasattr(self, 'progress_window') and self.progress_window.winfo_exists():
+            self.progress_window.destroy()
+            
+        # Update the parsed items
+        self._append_parsed_items(parsed_list, aggregated_text)
+        
+        # Show completion message
+        if success_count == total_count:
+            logging.info(f"All {total_count} files processed successfully")
+            messagebox.showinfo(
+                "Processing Complete", 
+                f"Successfully processed all {total_count} files."
+            )
+        elif success_count > 0:
+            logging.info(f"Partial success: {success_count}/{total_count} files processed")
+            messagebox.showwarning(
+                "Processing Partially Complete", 
+                f"Successfully processed {success_count} out of {total_count} files.\n\nCheck the logs for details on failed files."
+            )
+        else:
+            logging.error("No files were successfully processed")
+            messagebox.showerror(
+                "Processing Failed", 
+                "Failed to process any of the selected files.\n\nCheck the logs for error details."
             )
 
     def _append_parsed_items(self, new_items, aggregated_text: str):
@@ -1669,99 +2334,473 @@ class OllamaGUI(tk.Tk):
             self._parsed_files_tooltip.text = text or ""
 
     def _parse_single_file_collect(self, file_path) -> str:
-        """Parse a single file and return its extracted text without touching UI state."""
+        """Parse a single file and return its extracted text with performance optimizations."""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        
+        logging.info(f"  → Starting processing pipeline for {file_ext} file: {os.path.basename(file_path)}")
+        
+        # Performance optimization: Skip very large files or use streaming for them
+        if file_size > 100 * 1024 * 1024:  # 100MB threshold
+            logging.warning(f"  → Large file detected ({file_size / (1024*1024):.1f} MB). Using optimized processing...")
+            return self._parse_large_file_optimized(file_path)
+        
+        # Performance optimization: Use faster fallback for known simple formats first
+        if file_ext in ['.txt', '.md', '.csv', '.json']:
+            logging.info(f"  → Fast-track processing for simple format: {file_ext}")
+            fast_result = self._try_fast_processing(file_path, file_ext)
+            if fast_result:
+                return fast_result
+        
         converter = DocumentConverter()
         result = None
         try:
-            result = converter.convert(file_path)
+            logging.info(f"  → Step 1/4: Initializing Docling DocumentConverter for {file_ext} format")
+            start_time = time.time()
+            
+            # Performance optimization: Configure Docling for faster processing with timeout
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Docling conversion timed out")
+            
+            # Set timeout for Docling conversion (5 minutes max)
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(300)  # 5 minutes timeout
+            
+            try:
+                result = converter.convert(file_path)
+                signal.alarm(0)  # Cancel timeout
+                
+                conversion_time = time.time() - start_time
+                logging.info(f"  → Step 1/4: ✓ Docling conversion completed in {conversion_time:.2f}s")
+            except TimeoutError:
+                signal.alarm(0)  # Cancel timeout
+                raise TimeoutError("Docling conversion exceeded 5 minute timeout")
+                
         except Exception as e:
             logging.warning(
-                "Docling conversion failed for %s: %s", os.path.basename(file_path), e
+                "  → Step 1/4: ✗ Docling conversion failed for %s: %s", os.path.basename(file_path), e
             )
+            logging.info(f"  → Will attempt fallback processing methods...")
 
         content_parts = []
         if result:
+            logging.info(f"  → Step 2/4: Processing Docling conversion result...")
             if hasattr(result, "documents") and result.documents:
-                content_parts.extend(
-                    doc.export_to_markdown() for doc in result.documents
-                )
+                doc_count = len(result.documents)
+                logging.info(f"  → Found {doc_count} document(s) in Docling result")
+                for i, doc in enumerate(result.documents, 1):
+                    logging.info(f"  → Exporting document {i}/{doc_count} to markdown...")
+                    markdown_content = doc.export_to_markdown()
+                    content_parts.append(markdown_content)
+                    logging.info(f"  → Document {i}/{doc_count}: {len(markdown_content):,} characters exported")
+                logging.info(f"  → Step 2/4: ✓ All {doc_count} documents exported to markdown")
             elif hasattr(result, "document") and result.document:
-                content_parts.append(result.document.export_to_markdown())
+                logging.info(f"  → Found single document in Docling result")
+                markdown_content = result.document.export_to_markdown()
+                content_parts.append(markdown_content)
+                logging.info(f"  → Step 2/4: ✓ Single document exported: {len(markdown_content):,} characters")
+            else:
+                logging.warning(f"  → Step 2/4: ✗ Docling result contains no usable documents")
+        else:
+            logging.info(f"  → Step 2/4: No Docling result to process, moving to fallback methods")
 
         if not content_parts and file_path.lower().endswith(".pptx"):
+            logging.info(f"  → Step 3/4: Attempting PPTX fallback processing with python-pptx...")
             try:
                 from pptx import Presentation
 
                 prs = Presentation(file_path)
                 slides_text = []
-                for slide in prs.slides:
-                    slides_text.extend(
-                        shape.text for shape in slide.shapes if hasattr(shape, "text")
-                    )
+                slide_count = len(prs.slides)
+                logging.info(f"  → PPTX file contains {slide_count} slides")
+                
+                for i, slide in enumerate(prs.slides, 1):
+                    logging.info(f"  → Processing slide {i}/{slide_count}...")
+                    slide_shapes = [shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()]
+                    if slide_shapes:
+                        slides_text.extend(slide_shapes)
+                        logging.info(f"  → Slide {i}: extracted {len(slide_shapes)} text elements")
+                    else:
+                        logging.info(f"  → Slide {i}: no text content found")
+                        
                 if slides_text:
-                    content_parts.append("\n\n".join(slides_text))
+                    combined_text = "\n\n".join(slides_text)
+                    content_parts.append(combined_text)
+                    logging.info(f"  → Step 3/4: ✓ PPTX fallback successful: {len(combined_text):,} characters from {slide_count} slides")
+                else:
+                    logging.warning(f"  → Step 3/4: ✗ PPTX fallback found no text content in any slides")
             except Exception as e:
-                logging.warning("PPTX fallback failed for %s: %s", file_path, e)
+                logging.warning("  → Step 3/4: ✗ PPTX fallback failed for %s: %s", os.path.basename(file_path), e)
 
-        # Excel fallback
+        # Excel fallback with performance optimizations
         if not content_parts and (
             file_path.lower().endswith(".xlsx") or file_path.lower().endswith(".xls")
         ):
+            logging.info(f"  → Step 3/4: Attempting Excel fallback processing with pandas...")
             try:
                 excel = pd.ExcelFile(file_path)
+                sheet_count = len(excel.sheet_names)
+                logging.info(f"  → Excel file contains {sheet_count} sheets: {excel.sheet_names}")
+                
+                # Performance optimization: Limit number of sheets processed for large files
+                file_size_mb = file_size / (1024 * 1024)
+                max_sheets = 10 if file_size_mb > 20 else sheet_count
+                if sheet_count > max_sheets:
+                    logging.info(f"  → Large Excel file ({file_size_mb:.1f} MB), processing first {max_sheets} sheets only")
+                    sheets_to_process = excel.sheet_names[:max_sheets]
+                else:
+                    sheets_to_process = excel.sheet_names
+                
                 sheet_md_parts = []
-                for sheet in excel.sheet_names:
+                for i, sheet in enumerate(sheets_to_process, 1):
+                    logging.info(f"  → Processing sheet {i}/{len(sheets_to_process)}: '{sheet}'...")
                     try:
-                        df = excel.parse(sheet)
-                        preview = df.head(200)
+                        # Performance optimization: Read only first N rows for large files
+                        nrows = 1000 if file_size_mb > 10 else None
+                        df = excel.parse(sheet, nrows=nrows)
+                        rows, cols = df.shape
+                        logging.info(f"  → Sheet '{sheet}': {rows:,} rows × {cols} columns")
+                        
+                        # Performance optimization: Adaptive preview size
+                        preview_size = min(100 if file_size_mb > 20 else 200, rows)
+                        preview = df.head(preview_size)
+                        preview_rows = len(preview)
+                        logging.info(f"  → Creating markdown preview for first {preview_rows} rows...")
+                        
                         md = preview.to_markdown(index=False)
-                        sheet_md_parts.append(f"# Sheet: {sheet}\n\n{md}")
+                        sheet_md = f"# Sheet: {sheet}\n\n{md}"
+                        sheet_md_parts.append(sheet_md)
+                        logging.info(f"  → Sheet '{sheet}': ✓ {len(sheet_md):,} characters generated")
                     except Exception as se:
+                        logging.warning(f"  → Sheet '{sheet}': ✗ Failed to process: {se}")
                         sheet_md_parts.append(
                             f"# Sheet: {sheet}\n\n(Unable to parse sheet: {se})"
                         )
+                        
                 if sheet_md_parts:
-                    content_parts.append("\n\n---\n\n".join(sheet_md_parts))
+                    combined_content = "\n\n---\n\n".join(sheet_md_parts)
+                    content_parts.append(combined_content)
+                    logging.info(f"  → Step 3/4: ✓ Excel fallback successful: {len(combined_content):,} characters from {len(sheet_md_parts)} sheets")
+                else:
+                    logging.warning(f"  → Step 3/4: ✗ Excel fallback found no processable sheets")
             except Exception as e:
-                logging.warning("Excel fallback failed for %s: %s", file_path, e)
+                logging.warning("  → Step 3/4: ✗ Excel fallback failed for %s: %s", os.path.basename(file_path), e)
 
-        # CSV fallback
+        # CSV fallback with performance optimizations
         if not content_parts and file_path.lower().endswith(".csv"):
+            logging.info(f"  → Step 3/4: Attempting CSV fallback processing with pandas...")
             try:
-                df = pd.read_csv(file_path, on_bad_lines="skip")
-                preview = df.head(500)
+                logging.info(f"  → Reading CSV file...")
+                
+                # Performance optimization: Use chunking for large CSV files
+                file_size_mb = file_size / (1024 * 1024)
+                if file_size_mb > 50:  # For files larger than 50MB
+                    logging.info(f"  → Large CSV detected ({file_size_mb:.1f} MB), using chunked reading...")
+                    chunk_size = 1000
+                    df_chunks = pd.read_csv(file_path, chunksize=chunk_size, on_bad_lines="skip")
+                    first_chunk = next(df_chunks)
+                    total_cols = len(first_chunk.columns)
+                    preview = first_chunk.head(500)
+                    logging.info(f"  → CSV chunk processed: {len(preview)} rows × {total_cols} columns (chunked mode)")
+                else:
+                    df = pd.read_csv(file_path, on_bad_lines="skip")
+                    total_rows, total_cols = df.shape
+                    logging.info(f"  → CSV contains {total_rows:,} rows × {total_cols} columns")
+                    
+                    # Performance optimization: Limit preview size based on file size
+                    preview_size = min(500 if file_size_mb < 10 else 200, total_rows)
+                    logging.info(f"  → Creating preview of first {preview_size} rows...")
+                    preview = df.head(preview_size)
+                
+                logging.info(f"  → Converting to markdown format...")
                 md = preview.to_markdown(index=False)
-                content_parts.append(f"# CSV Preview (first 500 rows)\n\n{md}")
+                csv_content = f"# CSV Preview (first {len(preview)} rows)\n\n{md}"
+                content_parts.append(csv_content)
+                
+                logging.info(f"  → Step 3/4: ✓ CSV fallback successful: {len(csv_content):,} characters ({len(preview)} rows processed)")
             except Exception as e:
-                logging.warning("CSV fallback failed for %s: %s", file_path, e)
+                logging.warning("  → Step 3/4: ✗ CSV fallback failed for %s: %s", os.path.basename(file_path), e)
 
         # JSON fallback
         if not content_parts and file_path.lower().endswith(".json"):
+            logging.info(f"  → Step 3/4: Attempting JSON fallback processing...")
             try:
+                logging.info(f"  → Reading JSON file...")
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    
+                logging.info(f"  → Analyzing JSON structure...")
                 if isinstance(data, list) and data and isinstance(data[0], dict):
+                    record_count = len(data)
+                    logging.info(f"  → JSON contains {record_count:,} records (tabular format detected)")
+                    
+                    logging.info(f"  → Converting to DataFrame...")
                     df = pd.DataFrame(data)
-                    preview = df.head(500)
+                    rows, cols = df.shape
+                    logging.info(f"  → DataFrame: {rows:,} rows × {cols} columns")
+                    
+                    preview_size = min(500, rows)
+                    logging.info(f"  → Creating table preview of first {preview_size} rows...")
+                    preview = df.head(preview_size)
+                    
                     md = preview.to_markdown(index=False)
-                    content_parts.append(
-                        f"# JSON Table Preview (first 500 rows)\n\n{md}"
-                    )
+                    json_content = f"# JSON Table Preview (first {preview_size} rows)\n\n{md}"
+                    content_parts.append(json_content)
+                    logging.info(f"  → Step 3/4: ✓ JSON table fallback successful: {len(json_content):,} characters ({preview_size}/{record_count} records)")
                 else:
+                    logging.info(f"  → JSON contains non-tabular data, formatting as pretty-printed JSON")
                     pretty = json.dumps(data, indent=2, ensure_ascii=False)[:200000]
-                    content_parts.append(f"```json\n{pretty}\n```")
+                    json_content = f"```json\n{pretty}\n```"
+                    content_parts.append(json_content)
+                    logging.info(f"  → Step 3/4: ✓ JSON pretty-print fallback successful: {len(json_content):,} characters")
+                    
             except Exception as e:
-                logging.warning("JSON fallback failed for %s: %s", file_path, e)
+                logging.warning("  → Step 3/4: ✗ JSON fallback failed for %s: %s", os.path.basename(file_path), e)
+        
+        # PDF fallback using PyPDF2 or pdfplumber when Docling fails
+        if not content_parts and file_path.lower().endswith(".pdf"):
+            logging.info(f"  → Step 3/4: Attempting PDF fallback processing...")
+            
+            # Try PyPDF2 first (faster but less accurate)
+            try:
+                logging.info(f"  → Trying PyPDF2 for basic text extraction...")
+                import PyPDF2
+                
+                with open(file_path, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    num_pages = len(pdf_reader.pages)
+                    logging.info(f"  → PDF contains {num_pages} pages")
+                    
+                    text_parts = []
+                    max_pages = min(50, num_pages)  # Limit to first 50 pages for performance
+                    
+                    for i in range(max_pages):
+                        try:
+                            page = pdf_reader.pages[i]
+                            text = page.extract_text()
+                            if text.strip():
+                                text_parts.append(f"# Page {i+1}\n\n{text}")
+                                logging.info(f"  → Page {i+1}/{max_pages}: {len(text)} characters extracted")
+                            else:
+                                logging.info(f"  → Page {i+1}/{max_pages}: no text found")
+                        except Exception as pe:
+                            logging.warning(f"  → Page {i+1} extraction failed: {pe}")
+                    
+                    if text_parts:
+                        pdf_content = "\n\n---\n\n".join(text_parts)
+                        if max_pages < num_pages:
+                            pdf_content += f"\n\n[... Showing first {max_pages} of {num_pages} pages ...]"
+                        content_parts.append(pdf_content)
+                        logging.info(f"  → Step 3/4: ✓ PyPDF2 fallback successful: {len(pdf_content):,} characters from {len(text_parts)} pages")
+                    else:
+                        logging.warning(f"  → PyPDF2 extracted no text from PDF")
+                        
+            except ImportError:
+                logging.info(f"  → PyPDF2 not available, trying pdfplumber...")
+                
+                # Try pdfplumber as secondary fallback
+                try:
+                    import pdfplumber
+                    
+                    with pdfplumber.open(file_path) as pdf:
+                        num_pages = len(pdf.pages)
+                        logging.info(f"  → PDF contains {num_pages} pages (pdfplumber)")
+                        
+                        text_parts = []
+                        max_pages = min(20, num_pages)  # More conservative limit for pdfplumber
+                        
+                        for i in range(max_pages):
+                            try:
+                                page = pdf.pages[i]
+                                text = page.extract_text()
+                                if text and text.strip():
+                                    text_parts.append(f"# Page {i+1}\n\n{text}")
+                                    logging.info(f"  → Page {i+1}/{max_pages}: {len(text)} characters extracted")
+                                else:
+                                    logging.info(f"  → Page {i+1}/{max_pages}: no text found")
+                            except Exception as pe:
+                                logging.warning(f"  → Page {i+1} extraction failed: {pe}")
+                        
+                        if text_parts:
+                            pdf_content = "\n\n---\n\n".join(text_parts)
+                            if max_pages < num_pages:
+                                pdf_content += f"\n\n[... Showing first {max_pages} of {num_pages} pages ...]"
+                            content_parts.append(pdf_content)
+                            logging.info(f"  → Step 3/4: ✓ pdfplumber fallback successful: {len(pdf_content):,} characters from {len(text_parts)} pages")
+                        else:
+                            logging.warning(f"  → pdfplumber extracted no text from PDF")
+                            
+                except ImportError:
+                    logging.warning(f"  → No PDF fallback libraries available (PyPDF2, pdfplumber)")
+                    # Create a basic message for unsupported PDF
+                    pdf_content = f"# PDF Processing Failed\n\nThis PDF file could not be processed. Docling conversion failed and no fallback PDF libraries are available.\n\nTo enable PDF fallback processing, install:\n- PyPDF2: `pip install PyPDF2`\n- pdfplumber: `pip install pdfplumber`"
+                    content_parts.append(pdf_content)
+                    logging.info(f"  → Step 3/4: Added PDF processing failure notice")
+                    
+            except Exception as e:
+                logging.warning(f"  → Step 3/4: ✗ PDF fallback failed: {e}")
+                # Still provide a helpful message
+                pdf_content = f"# PDF Processing Error\n\nFailed to process PDF file: {str(e)}\n\nThis may be due to:\n- Encrypted/password-protected PDF\n- Corrupted PDF file\n- Complex PDF layout\n- Missing dependencies"
+                content_parts.append(pdf_content)
+                logging.info(f"  → Step 3/4: Added PDF error message")
 
-        return "\n\n".join(content_parts) if content_parts else ""
+        # Final result compilation
+        if content_parts:
+            final_content = "\n\n".join(content_parts)
+            logging.info(f"  → Step 4/4: ✓ Content compilation successful")
+            logging.info(f"  → Final result: {len(final_content):,} total characters from {len(content_parts)} content part(s)")
+            logging.info(f"  → Processing complete for {os.path.basename(file_path)}")
+            return final_content
+        else:
+            logging.error(f"  → Step 4/4: ✗ No content extracted from any processing method")
+            logging.error(f"  → Processing failed for {os.path.basename(file_path)}")
+            return ""
+    
+    def _try_fast_processing(self, file_path, file_ext):
+        """Try fast processing for simple file formats."""
+        try:
+            if file_ext in ['.txt', '.md']:
+                logging.info(f"  → Fast text processing for {file_ext}...")
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                if content.strip():
+                    logging.info(f"  → Fast processing successful: {len(content):,} characters")
+                    return content
+                    
+            elif file_ext == '.csv':
+                logging.info(f"  → Fast CSV processing...")
+                # Quick CSV processing for smaller files
+                file_size = os.path.getsize(file_path)
+                if file_size < 10 * 1024 * 1024:  # Less than 10MB
+                    df = pd.read_csv(file_path, nrows=1000, on_bad_lines="skip")
+                    rows, cols = df.shape
+                    md = df.head(min(200, rows)).to_markdown(index=False)
+                    content = f"# CSV Quick Preview ({rows} rows × {cols} columns)\n\n{md}"
+                    logging.info(f"  → Fast CSV processing successful: {len(content):,} characters")
+                    return content
+                    
+            elif file_ext == '.json':
+                logging.info(f"  → Fast JSON processing...")
+                file_size = os.path.getsize(file_path)
+                if file_size < 5 * 1024 * 1024:  # Less than 5MB
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                        df = pd.DataFrame(data[:500])  # Limit to first 500 records
+                        md = df.head(100).to_markdown(index=False)
+                        content = f"# JSON Quick Preview (first 100 records)\n\n{md}"
+                    else:
+                        content = f"```json\n{json.dumps(data, indent=2)[:50000]}\n```"
+                    
+                    logging.info(f"  → Fast JSON processing successful: {len(content):,} characters")
+                    return content
+                    
+        except Exception as e:
+            logging.info(f"  → Fast processing failed for {file_ext}: {e}, falling back to standard processing")
+            
+        return None
+    
+    def _parse_large_file_optimized(self, file_path):
+        """Optimized processing for very large files (>100MB)."""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
+        logging.info(f"  → Large file optimization for {file_size_mb:.1f} MB {file_ext} file")
+        
+        try:
+            if file_ext in ['.txt', '.md']:
+                # Read first 1MB of text files
+                logging.info(f"  → Reading first 1MB of large text file...")
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(1024 * 1024)  # 1MB
+                content += "\n\n[... File truncated due to size ...]" if len(content) == 1024 * 1024 else ""
+                logging.info(f"  → Large text file processing: {len(content):,} characters extracted")
+                return content
+                
+            elif file_ext == '.csv':
+                # Process first 5000 rows of large CSV
+                logging.info(f"  → Processing first 5000 rows of large CSV...")
+                df = pd.read_csv(file_path, nrows=5000, on_bad_lines="skip")
+                rows, cols = df.shape
+                preview = df.head(200)
+                md = preview.to_markdown(index=False)
+                content = f"# Large CSV Sample ({rows:,} rows × {cols} columns - showing first 200)\n\n{md}\n\n[... File truncated due to size ...]"
+                logging.info(f"  → Large CSV processing: {len(content):,} characters extracted")
+                return content
+                
+            elif file_ext in ['.xlsx', '.xls']:
+                # Process only first sheet, limited rows
+                logging.info(f"  → Processing first sheet of large Excel file...")
+                excel = pd.ExcelFile(file_path)
+                first_sheet = excel.sheet_names[0]
+                df = excel.parse(first_sheet, nrows=1000)
+                rows, cols = df.shape
+                preview = df.head(100)
+                md = preview.to_markdown(index=False)
+                content = f"# Large Excel Sample - Sheet: {first_sheet} ({rows:,} rows × {cols} columns - showing first 100)\n\n{md}\n\n[... File truncated due to size ...]"
+                logging.info(f"  → Large Excel processing: {len(content):,} characters extracted")
+                return content
+                
+            elif file_ext == '.pdf':
+                # For large PDFs, try basic text extraction with limits
+                logging.info(f"  → Processing large PDF with basic extraction...")
+                try:
+                    import PyPDF2
+                    with open(file_path, 'rb') as file:
+                        pdf_reader = PyPDF2.PdfReader(file)
+                        num_pages = len(pdf_reader.pages)
+                        
+                        # For large PDFs, only process first 10 pages
+                        max_pages = min(10, num_pages)
+                        text_parts = []
+                        
+                        for i in range(max_pages):
+                            try:
+                                page = pdf_reader.pages[i]
+                                text = page.extract_text()
+                                if text.strip():
+                                    # Limit text per page for large files
+                                    text = text[:5000] + "..." if len(text) > 5000 else text
+                                    text_parts.append(f"# Page {i+1}\n\n{text}")
+                            except Exception:
+                                continue
+                        
+                        if text_parts:
+                            content = "\n\n---\n\n".join(text_parts)
+                            content += f"\n\n[... Large PDF: Showing first {max_pages} of {num_pages} pages ...]"
+                            logging.info(f"  → Large PDF processing: {len(content):,} characters from {len(text_parts)} pages")
+                            return content
+                        
+                except ImportError:
+                    pass
+                
+                # Fallback message for large PDFs
+                content = f"# Large PDF Notice\n\nThis PDF file ({file_size_mb:.1f} MB) is too large for full processing.\nFor better results with large PDFs, consider:\n- Using a dedicated PDF processing tool\n- Splitting the PDF into smaller files\n- Installing PyPDF2 or pdfplumber for basic text extraction"
+                logging.info(f"  → Large PDF: provided notice message")
+                return content
+                
+            else:
+                # For other large files, return a message
+                content = f"# Large File Notice\n\nThis {file_ext} file ({file_size_mb:.1f} MB) is too large for full processing.\nPlease consider splitting it into smaller files or using a more specific processing tool."
+                logging.info(f"  → Large file skipped: {file_ext} format not supported for large files")
+                return content
+                
+        except Exception as e:
+            logging.error(f"  → Large file optimization failed: {e}")
+            return f"# Large File Processing Error\n\nFailed to process large {file_ext} file ({file_size_mb:.1f} MB): {str(e)}"
 
     def clear_uploaded_files(self):
         """Clear any uploaded/parsed files and their aggregated content."""
+        previous_count = len(self.parsed_files) if self.parsed_files else 0
         self.parsed_files = []
         self.parsed_document_content = None
         self.ui.parsed_file_label.config(text="No file loaded.")
         self._set_parsed_label_tooltip("")
         self._save_conversation_state()
+        logging.info(f"Cleared {previous_count} uploaded files")
 
     def _show_parsing_error(self, error):
         """Display parsing error in a thread-safe way."""
@@ -2040,6 +3079,192 @@ class OllamaGUI(tk.Tk):
             )
         finally:
             self.ui.crawl_button.config(text="Crawl Site", state="normal")
+
+    def crawl_site_playwright(self):
+        """Crawl pages using Playwright to handle dynamic or protected sites."""
+        url = self.ui.url_entry.get().strip()
+
+        if not url or url == self.ui.url_placeholder:
+            messagebox.showerror("Error", "Please enter a URL to crawl.")
+            return
+
+        max_pages = simpledialog.askinteger(
+            "Crawl Settings",
+            "Maximum number of pages to crawl (Playwright):",
+            initialvalue=5,
+            minvalue=1,
+            maxvalue=20,
+        )
+
+        if not max_pages:
+            return
+
+        try:
+            self._reset_crawl_insights()
+            self.ui.crawl_insights_status.config(text="Playwright crawl in progress…")
+            self.ui.crawl_stop_button.config(state="normal")
+            self.ui.playwright_crawl_button.config(text="Crawling...", state="disabled")
+            self.update_idletasks()
+
+            username = self.ui.username_entry.get().strip()
+            password = self.ui.password_entry.get().strip()
+            creds_provided = (
+                username
+                and password
+                and username != "Username"
+                and password != "Password"
+            )
+
+            login_selectors = (
+                self.ui.login_selectors
+                if getattr(self.ui, "login_analyzed", False)
+                else None
+            )
+
+            include_ai_summary = bool(self.ui.ai_summary_var.get())
+
+            def _progress(entry: Dict[str, Any]) -> bool:
+                return self._handle_crawl_progress(entry)
+
+            results = playwright_crawl_sync(
+                url,
+                max_pages=max_pages,
+                same_domain_only=True,
+                username=username if creds_provided else None,
+                password=password if creds_provided else None,
+                login_selectors=login_selectors,
+                include_ai_summary=include_ai_summary,
+                progress_callback=_progress,
+            )
+
+            success = [res for res in results if "Error" not in res.get("name", "")]
+
+            if not success:
+                messagebox.showwarning(
+                    "No Content", "No pages were successfully crawled with Playwright."
+                )
+                self.ui.crawl_insights_status.config(text="Crawl finished without content.")
+                return
+
+            self.parsed_files.extend(success)
+            self._update_parsed_label_from_state()
+            self._save_conversation_state()
+
+            if include_ai_summary:
+                self._log_crawl_insights_to_conversation(success)
+
+            messagebox.showinfo(
+                "Success",
+                f"Crawled {len(success)} page(s) using Playwright."
+                + (" Summaries generated." if include_ai_summary else ""),
+            )
+
+            self.ui.crawl_insights_status.config(
+                text=f"Crawl complete. {len(success)} page(s) captured."
+            )
+
+        except Exception as exc:
+            messagebox.showerror("Crawl Error", f"Playwright crawl failed:\n{str(exc)}")
+            self.ui.crawl_insights_status.config(text="Crawl failed.")
+        finally:
+            self.stop_crawl_flag = False
+            self.ui.crawl_stop_button.config(state="disabled")
+            self.ui.playwright_crawl_button.config(
+                text="Playwright Crawl", state="normal"
+            )
+
+    def launch_manual_verification(self):
+        """Open a dialog instructing the user to complete verification manually."""
+        top = tk.Toplevel(self)
+        top.title("Manual Verification Required")
+        top.geometry("420x260")
+        top.transient(self)
+        top.grab_set()
+
+        ttk.Label(
+            top,
+            text=(
+                "A bot-detection challenge is blocking automation.\n"
+                "If you enabled 'Attach to existing browser', solve the challenge "
+                "in that Chrome window. Otherwise, you can open a new verification "
+                "browser below.\nOnce the site is accessible, click 'Session ready'."
+            ),
+            wraplength=380,
+            justify="left",
+        ).pack(padx=15, pady=(20, 15), anchor="w")
+
+        ttk.Button(
+            top,
+            text="Open Browser",
+            command=lambda: self._open_manual_browser(top),
+        ).pack(pady=(0, 10))
+
+        ttk.Button(
+            top,
+            text="Session ready",
+            command=lambda: self._on_manual_ready(top),
+        ).pack(pady=(0, 5))
+
+        ttk.Button(top, text="Cancel", command=top.destroy).pack(pady=(0, 10))
+
+    def _open_manual_browser(self, dialog):
+        try:
+            from playwright.sync_api import sync_playwright
+
+            url = self.ui.url_entry.get().strip()
+            if not url or url == self.ui.url_placeholder:
+                messagebox.showerror("Error", "Please enter a URL to open.")
+                return
+
+            def _launch():
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=False)
+                    page = browser.new_page()
+                    page.goto(url)
+                    messagebox.showinfo(
+                        "Browser Launched",
+                        "A Playwright-controlled browser has been opened.\n"
+                        "Complete the verification and close the browser when finished.",
+                    )
+                    browser.close()
+
+            threading.Thread(target=_launch, daemon=True).start()
+        except Exception as exc:
+            messagebox.showerror(
+                "Launch Error",
+                f"Failed to open manual verification browser:\n{exc}",
+            )
+
+    def _on_manual_ready(self, dialog):
+        dialog.destroy()
+        messagebox.showinfo(
+            "Session Ready",
+            "Great! The session cookies should now allow automated crawling again."
+        )
+
+    def _toggle_remote_endpoint(self):
+        attach = bool(self.ui.remote_toggle_var.get())
+        endpoint = self.ui.remote_endpoint_var.get().strip()
+
+        if attach:
+            if not endpoint:
+                messagebox.showerror(
+                    "Missing Endpoint",
+                    "Enter the remote debugging URL (e.g. http://localhost:9222) before enabling attachment.",
+                )
+                self.ui.remote_toggle_var.set(False)
+                return
+            os.environ["PLAYWRIGHT_REMOTE_ENDPOINT"] = endpoint
+            messagebox.showinfo(
+                "Remote Attachment Enabled",
+                f"Playwright will now connect to the browser at {endpoint}.",
+            )
+        else:
+            os.environ.pop("PLAYWRIGHT_REMOTE_ENDPOINT", None)
+            messagebox.showinfo(
+                "Remote Attachment Disabled",
+                "Playwright will launch its own browser instances again.",
+            )
 
     def scrape_with_login(self):
         """Scrape content from a site requiring authentication."""
